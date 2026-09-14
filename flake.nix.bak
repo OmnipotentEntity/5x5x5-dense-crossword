@@ -1,0 +1,33 @@
+{
+  inputs = {
+    flakeUtils.url = "github:numtide/flake-utils";
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+  };
+  outputs = { self, ... } @ inputs:
+    inputs.flakeUtils.lib.eachSystem [ "x86_64-linux" ] (system:
+      let
+        pkgs = import inputs.nixpkgs {
+          inherit system;
+          config.allowUnfree = true;
+        };
+
+      in rec {
+        devShells = {
+          # The activation script can be used as dev-shell
+          default = with pkgs; mkShell {
+            buildInputs = [
+              z3
+              python3
+              python3Packages.z3-solver
+              python3Packages.numpy
+              cargo
+              rustc
+              rustfmt
+            ];
+          };
+        };
+
+        devShell = devShells.default;
+      }
+    );
+}
