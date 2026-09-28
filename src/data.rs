@@ -11,14 +11,14 @@ use heed::{
     byteorder::NativeEndian, types::U32, BoxedError, BytesDecode, BytesEncode, Database, Env,
 };
 use indicatif::ProgressBar;
-use ndarray::{s, Array, Array2, Array3, ArrayView, Axis};
+use ndarray::{s, Array, Array2, ArrayView1, /*Array3, ArrayView,*/ Axis};
 
-const EMPTY_CELL: char = ' ';
-const LENGTH: usize = 5;
+pub const EMPTY_CELL: char = ' ';
+pub const LENGTH: usize = 5;
 const TXN_SIZE: u32 = 1024 * 1024;
 
 pub type PrefixSet = HashMap<Vec<char>, HashSet<u16>>;
-pub type ErrT = Box<dyn Error>;
+pub type ErrT = Box<dyn Error + Send + Sync>;
 
 #[derive(Debug)]
 pub struct JsonParseError {
@@ -45,10 +45,10 @@ pub type Nu32 = U32<NativeEndian>;
 
 /// The thing that we actually store inside of the database
 pub struct WordDbEntry {
-    word_square: Array2<char>,
+    pub word_square: Array2<char>,
     /// Contains indices into the words array for each words in the word square
     /// Indices are compressed to u16 to save space
-    word_square_words: Vec<u16>,
+    pub word_square_words: HashSet<u16>,
 }
 
 pub struct WordDbEntryCodec;
@@ -119,7 +119,7 @@ enum JsonReaderState {
 }
 
 // The structure of the json file is known, so a Q&D parser is used here
-fn read_json_with_visitor<T: FnMut(Array2<char>, u32) -> Result<(), ErrT>>(
+fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool) -> Result<(), ErrT>>(
     json_file: String,
     insert_record: &mut T,
 ) -> Result<(), ErrT> {
@@ -136,12 +136,15 @@ fn read_json_with_visitor<T: FnMut(Array2<char>, u32) -> Result<(), ErrT>>(
     let buf = io::BufReader::new(file);
 
     let mut state_vec: Vec<JsonReaderState> = Vec::new();
-    let mut data_vec: Array2<char> = Array2::from_shape_fn((LENGTH, LENGTH), |_| EMPTY_CELL);
+    let mut data_vec: Array2<char> = Array2::from_elem((LENGTH, LENGTH), EMPTY_CELL);
     let mut data_idx_major: usize = 0;
     let mut data_idx_minor: usize = 0;
     let mut db_id: u32 = 0;
 
     let pb = ProgressBar::new(records);
+
+    let mut last_top_left = ' ';
+    let mut top_left_changed = false;
 
     for byte in buf.bytes() {
         if byte.is_err() {
@@ -190,7 +193,7 @@ fn read_json_with_visitor<T: FnMut(Array2<char>, u32) -> Result<(), ErrT>>(
                         ))));
                     };
 
-                    insert_record(data_vec.clone(), db_id)?;
+                    insert_record(data_vec.clone(), db_id, top_left_changed)?;
                     db_id += 1;
                     pb.inc(1);
                     state_vec.pop();
@@ -227,6 +230,20 @@ fn read_json_with_visitor<T: FnMut(Array2<char>, u32) -> Result<(), ErrT>>(
 
             x @ 'a'..='z' => {
                 if state_vec.last() == Some(&JsonReaderState::String) {
+                    // Ensure that the database is sorted by the top left value.
+                    if (data_idx_major, data_idx_minor) == (0, 0) {
+                        if x < last_top_left {
+                            return Err(Box::new(JsonParseError::new(format!(
+                                "Json is not sorted at index {}: {} < {}",
+                                db_id, x, last_top_left
+                            ))));
+                        } else if x != last_top_left {
+                            last_top_left = x;
+                            top_left_changed = true;
+                        } else {
+                            top_left_changed = false;
+                        }
+                    }
                     data_vec[(data_idx_major, data_idx_minor)] = x;
                     data_idx_minor += 1;
                 } else {
@@ -256,11 +273,14 @@ pub fn copy_json_to_database(
     word_square_db: &mut Database<Nu32, WordDbEntryCodec>,
     env: &Env,
     words: &Array2<char>,
-) -> Result<(), ErrT> {
+) -> Result<Vec<u32>, ErrT> {
     let mut wtxn = Some(env.write_txn()?);
 
+    let mut changes = Vec::new();
+
     read_json_with_visitor(json_file, &mut |data: Array2<char>,
-                                            id|
+                                            id,
+                                            top_left_changed|
      -> Result<(), ErrT> {
         let word_db_entry = WordDbEntry {
             word_square: data.clone(),
@@ -274,67 +294,53 @@ pub fn copy_json_to_database(
             txn.commit()?;
             wtxn = Some(env.write_txn()?);
         }
+        if top_left_changed {
+            changes.push(id);
+        }
 
         Ok(())
     })?;
 
     wtxn.unwrap().commit()?;
 
-    Ok(())
+    Ok(changes)
 }
 
-pub fn read_json_to_memory(json_file: String) -> Result<Array3<char>, ErrT> {
-    let mut result = ArrayView::from(&[' '; 0])
-        .into_shape_with_order((0, LENGTH, LENGTH))
-        .unwrap()
-        .to_owned();
-    read_json_with_visitor(json_file, &mut |data: Array2<char>,
-                                            _|
-     -> Result<(), ErrT> {
-        result.append(
-            Axis(0),
-            data.into_shape_with_order((1, LENGTH, LENGTH))
-                .expect("error with shape")
-                .view(),
-        );
-        Ok(())
-    })?;
-
-    Ok(result)
-}
-
-fn words_in_square(ws: &Array2<char>, words: &Array2<char>) -> Result<Vec<u16>, ErrT> {
-    let mut result = Vec::new();
+fn words_in_square(ws: &Array2<char>, words: &Array2<char>) -> Result<HashSet<u16>, ErrT> {
+    let mut result = HashSet::new();
     for i in 0..=1 {
-        'word_loop: for word in ws.axis_iter(Axis(i)) {
-            // binary search
-            let mut low = 0;
-            let mut high = words.shape()[0];
-
-            while low <= high {
-                let mid = (low + high) / 2;
-                if words.slice(s![mid, ..]) == word {
-                    result.push(mid as u16);
-                    continue 'word_loop;
-                } else if word.iter().collect::<String>()
-                    < words.slice(s![mid, ..]).iter().collect::<String>()
-                {
-                    high = mid - 1;
-                } else {
-                    low = mid + 1;
-                }
-            }
-
-            // could not find word in list
-            return Err(Box::new(JsonParseError::new(
-                "Unable to find word in list".into(),
-            )));
+        for word in ws.axis_iter(Axis(i)) {
+            result.insert(binary_search_words(word, words)?);
         }
     }
 
     assert!(result.len() == 2 * LENGTH);
 
     Ok(result)
+}
+
+pub fn binary_search_words(word: ArrayView1<char>, words: &Array2<char>) -> Result<u16, ErrT> {
+    // binary search
+    let mut low = 0;
+    let mut high = words.shape()[0];
+
+    while low <= high {
+        let mid = (low + high) / 2;
+        if words.slice(s![mid, ..]) == word {
+            return Ok(mid as u16);
+        } else if word.iter().collect::<String>()
+            < words.slice(s![mid, ..]).iter().collect::<String>()
+        {
+            high = mid - 1;
+        } else {
+            low = mid + 1;
+        }
+    }
+
+    // could not find word in list
+    return Err(Box::new(JsonParseError::new(
+        "Unable to find word in list".into(),
+    )));
 }
 
 /// Words are assumed sorted
