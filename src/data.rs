@@ -330,8 +330,7 @@ pub fn binary_search_words(word: ArrayView1<char>, words: &Array2<char>) -> Resu
         let mid = (low + high) / 2;
         if words.slice(s![mid, ..]) == word {
             return Ok(mid as u16);
-        } else if word.iter().cmp(words.slice(s![mid, ..]).iter()) == std::cmp::Ordering::Less
-        {
+        } else if word.iter().cmp(words.slice(s![mid, ..]).iter()) == std::cmp::Ordering::Less {
             high = mid - 1;
         } else {
             low = mid + 1;

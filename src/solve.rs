@@ -126,10 +126,13 @@ pub fn solve_word_cubes(
                 idx_mult += 1;
             }
 
-
             let result = stack(
                 Axis(0),
-                &results.iter().map(|x| x.view()).collect::<Vec<_>>().as_slice()
+                &results
+                    .iter()
+                    .map(|x| x.view())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
             )?
             .to_owned();
 
@@ -146,7 +149,11 @@ pub fn solve_word_cubes(
     }
     let result = concatenate(
         Axis(0),
-        &result_vec.iter().map(|x| x.view()).collect::<Vec<_>>().as_slice(),
+        &result_vec
+            .iter()
+            .map(|x| x.view())
+            .collect::<Vec<_>>()
+            .as_slice(),
     )?
     .to_owned();
 
@@ -156,7 +163,7 @@ pub fn solve_word_cubes(
 fn solve_word_cube_impl(
     wcd: &mut WordCubeData,
     depth: usize,
-    results: &mut Vec<Array3<char>>
+    results: &mut Vec<Array3<char>>,
 ) -> Result<(), ErrT> {
     let txn = wcd.read_txn;
     let mut idx = find_least_valid_index(wcd, depth);
@@ -220,14 +227,14 @@ fn try_place_word_square(
         let minor_idx = i % LENGTH;
         let prefix = Vec::from_iter(
             wcd.word_cube
-            .slice(s![0..depth, major_idx, minor_idx])
-            .iter()
-            .copied()
-            .chain(std::iter::once(if !transpose {
-                wdb.word_square[[major_idx, minor_idx]]
-            } else {
-                wdb.word_square[[minor_idx, major_idx]]
-            }))
+                .slice(s![0..depth, major_idx, minor_idx])
+                .iter()
+                .copied()
+                .chain(std::iter::once(if !transpose {
+                    wdb.word_square[[major_idx, minor_idx]]
+                } else {
+                    wdb.word_square[[minor_idx, major_idx]]
+                })),
         );
 
         match wcd.prefix_set.get(&prefix) {
