@@ -40,7 +40,7 @@ fn main() -> Result<(), ErrT> {
 
     let result = solve_word_cubes(words, Arc::new(word_square_db), &env, db_index)?;
 
-    let file = std::fs::File::open(cli.out_file)?;
+    let file = std::fs::File::create(cli.out_file)?;
     let file = std::io::BufWriter::new(file);
     serde_json::to_writer(file, &result)?;
 

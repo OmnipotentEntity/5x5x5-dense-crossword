@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread::{self, available_parallelism};
 
-use heed::{Database, Env};
-use ndarray::{concatenate, s, Array2, Array3, Array4, Axis};
+use heed::{Database, Env, RoTxn};
+use ndarray::{concatenate, s, stack, Array2, Array3, Array4, Axis};
 
 use crate::data::{
     generate_prefixes_from_words, ErrT, Nu32, PrefixSet, WordDbEntry, WordDbEntryCodec, EMPTY_CELL,
@@ -75,10 +75,10 @@ use crate::data::{
 /// ak = aA, and if ak > aA, then our cube is already non-canonical by construction, so we can
 /// disregard this situation entirely (we should never reach this case).
 
-struct WordCubeData {
+struct WordCubeData<'a> {
     word_cube: Array3<char>,
     word_square_db: Arc<Database<Nu32, WordDbEntryCodec>>,
-    env: Env,
+    read_txn: &'a RoTxn<'a>,
     db_offsets: Vec<u32>,
     prefix_set: PrefixSet,
     used_words: HashSet<u16>,
@@ -102,10 +102,10 @@ pub fn solve_word_cubes(
         let db_offsets = db_offsets.clone();
         let prefix_set = prefix_set.clone();
         let thread = thread::spawn(move || -> Result<Array4<char>, ErrT> {
-            let mut result = Box::new(Array4::from_elem((0, LENGTH, LENGTH, LENGTH), EMPTY_CELL));
-            let txn = Arc::new(env.read_txn().unwrap());
+            let mut results = Vec::new();
+            let txn = env.read_txn().unwrap();
             let idx_mod = i as u32;
-            let idx_mult = 0;
+            let mut idx_mult = 0;
             while let Ok(Some(db_entry)) =
                 word_square_db.get(&txn, &(idx_mult * num_threads + idx_mod))
             {
@@ -116,32 +116,39 @@ pub fn solve_word_cubes(
                 let mut wcd = WordCubeData {
                     word_cube: word_cube.clone(),
                     word_square_db: word_square_db.clone(),
-                    env: env.clone(),
+                    read_txn: &txn,
                     db_offsets: db_offsets.clone(),
                     prefix_set: prefix_set.clone(),
                     used_words: db_entry.word_square_words,
                 };
-                solve_word_cube_impl(&mut wcd, 1, &mut result)?;
+                solve_word_cube_impl(&mut wcd, 1, &mut results)?;
+
+                idx_mult += 1;
             }
 
-            Ok(*result)
+
+            let result = stack(
+                Axis(0),
+                &results.iter().map(|x| x.view()).collect::<Vec<_>>().as_slice()
+            )?
+            .to_owned();
+
+            Ok(result)
         });
 
         threads.push(thread);
     }
 
-    let mut result = Array4::from_elem((0, LENGTH, LENGTH, LENGTH), EMPTY_CELL);
+    let mut result_vec = Vec::new();
     for thread in threads {
         let thread_results = thread.join().unwrap().unwrap();
-        result = concatenate(
-            Axis(0),
-            &[
-                result.view(),
-                thread_results.to_shape((1, LENGTH, LENGTH, LENGTH))?.view(),
-            ],
-        )?
-        .to_owned();
+        result_vec.push(thread_results);
     }
+    let result = concatenate(
+        Axis(0),
+        &result_vec.iter().map(|x| x.view()).collect::<Vec<_>>().as_slice(),
+    )?
+    .to_owned();
 
     Ok(result)
 }
@@ -149,43 +156,25 @@ pub fn solve_word_cubes(
 fn solve_word_cube_impl(
     wcd: &mut WordCubeData,
     depth: usize,
-    result: &mut Array4<char>,
+    results: &mut Vec<Array3<char>>
 ) -> Result<(), ErrT> {
-    let env = wcd.env.clone();
-    let txn = env.read_txn().unwrap();
-    let idx = find_least_valid_index(wcd, depth);
+    let txn = wcd.read_txn;
+    let mut idx = find_least_valid_index(wcd, depth);
     while let Some(wdb) = wcd.word_square_db.get(&txn, &idx)? {
         let mut handle_word_square_symmetry = |transposed: bool| -> Result<(), ErrT> {
             let did_place = try_place_word_square(wcd, &wdb, depth, transposed);
             if did_place {
                 if depth == LENGTH - 1 {
                     println!("Found solution: {:?}", wcd.word_cube);
-                    let _ = std::mem::replace(
-                        result,
-                        concatenate(
-                            Axis(0),
-                            &[
-                                result.view(),
-                                wcd.word_cube
-                                    .to_shape((1, LENGTH, LENGTH, LENGTH))
-                                    .unwrap()
-                                    .view(),
-                            ],
-                        )?
-                        .to_owned(),
-                    );
+                    results.push(wcd.word_cube.clone());
                 } else {
-                    wcd.used_words = wcd
-                        .used_words
-                        .union(&wdb.word_square_words)
-                        .cloned()
-                        .collect();
-                    solve_word_cube_impl(wcd, depth + 1, result)?;
-                    wcd.used_words = wcd
-                        .used_words
-                        .difference(&wdb.word_square_words)
-                        .cloned()
-                        .collect();
+                    for &w in &wdb.word_square_words {
+                        wcd.used_words.insert(w);
+                    }
+                    solve_word_cube_impl(wcd, depth + 1, results)?;
+                    for &w in &wdb.word_square_words {
+                        wcd.used_words.remove(&w);
+                    }
                 }
             }
 
@@ -194,6 +183,8 @@ fn solve_word_cube_impl(
 
         handle_word_square_symmetry(false)?;
         handle_word_square_symmetry(true)?;
+
+        idx += 1;
     }
 
     Ok(())
@@ -227,24 +218,22 @@ fn try_place_word_square(
     for i in 0..(LENGTH * LENGTH) {
         let major_idx = i / LENGTH;
         let minor_idx = i % LENGTH;
-        let mut prefix = Vec::with_capacity(depth + 1);
-        prefix.extend(
+        let prefix = Vec::from_iter(
             wcd.word_cube
-                .slice(s![0..depth, major_idx, minor_idx])
-                .to_slice()
-                .unwrap(),
+            .slice(s![0..depth, major_idx, minor_idx])
+            .iter()
+            .copied()
+            .chain(std::iter::once(if !transpose {
+                wdb.word_square[[major_idx, minor_idx]]
+            } else {
+                wdb.word_square[[minor_idx, major_idx]]
+            }))
         );
 
-        if !transpose {
-            prefix.push(wdb.word_square[[major_idx, minor_idx]]);
-        } else {
-            prefix.push(wdb.word_square[[minor_idx, major_idx]]);
-        }
-
-        if let Some(prefixes) = wcd.prefix_set.get(&prefix) {
-            if prefixes.is_subset(&wcd.used_words) {
-                return false;
-            }
+        match wcd.prefix_set.get(&prefix) {
+            Some(prefixes) if prefixes.is_subset(&wcd.used_words) => return false,
+            None => return false,
+            _ => (),
         }
     }
 

@@ -119,7 +119,7 @@ enum JsonReaderState {
 }
 
 // The structure of the json file is known, so a Q&D parser is used here
-fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool) -> Result<(), ErrT>>(
+fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool, char) -> Result<(), ErrT>>(
     json_file: String,
     insert_record: &mut T,
 ) -> Result<(), ErrT> {
@@ -193,7 +193,7 @@ fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool) -> Result<(), ErrT>>
                         ))));
                     };
 
-                    insert_record(data_vec.clone(), db_id, top_left_changed)?;
+                    insert_record(data_vec.clone(), db_id, top_left_changed, last_top_left)?;
                     db_id += 1;
                     pb.inc(1);
                     state_vec.pop();
@@ -276,11 +276,12 @@ pub fn copy_json_to_database(
 ) -> Result<Vec<u32>, ErrT> {
     let mut wtxn = Some(env.write_txn()?);
 
-    let mut changes = Vec::new();
+    let mut changes = [0; 26];
 
     read_json_with_visitor(json_file, &mut |data: Array2<char>,
                                             id,
-                                            top_left_changed|
+                                            top_left_changed,
+                                            top_left|
      -> Result<(), ErrT> {
         let word_db_entry = WordDbEntry {
             word_square: data.clone(),
@@ -294,8 +295,9 @@ pub fn copy_json_to_database(
             txn.commit()?;
             wtxn = Some(env.write_txn()?);
         }
+
         if top_left_changed {
-            changes.push(id);
+            changes[top_left as usize - 'a' as usize] = id;
         }
 
         Ok(())
@@ -303,7 +305,7 @@ pub fn copy_json_to_database(
 
     wtxn.unwrap().commit()?;
 
-    Ok(changes)
+    Ok(Vec::from(changes))
 }
 
 fn words_in_square(ws: &Array2<char>, words: &Array2<char>) -> Result<HashSet<u16>, ErrT> {
@@ -328,8 +330,7 @@ pub fn binary_search_words(word: ArrayView1<char>, words: &Array2<char>) -> Resu
         let mid = (low + high) / 2;
         if words.slice(s![mid, ..]) == word {
             return Ok(mid as u16);
-        } else if word.iter().collect::<String>()
-            < words.slice(s![mid, ..]).iter().collect::<String>()
+        } else if word.iter().cmp(words.slice(s![mid, ..]).iter()) == std::cmp::Ordering::Less
         {
             high = mid - 1;
         } else {
@@ -345,24 +346,19 @@ pub fn binary_search_words(word: ArrayView1<char>, words: &Array2<char>) -> Resu
 
 /// Words are assumed sorted
 pub fn read_words_from_file(file: String) -> Array2<char> {
-    let mut result = Array2::<char>::default((0, LENGTH));
+    let mut raw_data = Vec::new();
+    let mut count = 0;
     if let Ok(lines) = read_lines(file) {
         for line in lines.map_while(Result::ok) {
-            if line.len() == LENGTH {
-                result
-                    .append(
-                        Axis(0),
-                        Array::from_iter(line.to_ascii_lowercase().chars())
-                            .into_shape_with_order((1, LENGTH))
-                            .expect("error with word length")
-                            .view(),
-                    )
-                    .expect("error with word length");
+            let line = line.trim().to_ascii_lowercase();
+            if line.chars().count() == LENGTH {
+                raw_data.extend(line.chars());
+                count += 1;
             }
         }
     }
 
-    result
+    Array2::from_shape_vec((count, LENGTH), raw_data).unwrap()
 }
 
 pub fn generate_prefixes_from_words(words: &Array2<char>) -> PrefixSet {
