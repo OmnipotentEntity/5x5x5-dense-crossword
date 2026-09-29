@@ -35,7 +35,7 @@ fn main() -> Result<(), ErrT> {
     let words = read_words_from_file(cli.word_file);
     println!("Done");
     println!("Reading squares from json");
-    let db_index = copy_json_to_database(cli.json_file, &mut word_square_db, &env, &words)?;
+    let db_index = copy_json_to_database(cli.json_file, &mut word_square_db, &env, &words, cli.limit_ws)?;
     println!("Done");
 
     let result = solve_word_cubes(words, Arc::new(word_square_db), &env, db_index)?;

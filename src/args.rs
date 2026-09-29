@@ -14,4 +14,8 @@ pub struct Args {
     /// Output file
     #[arg(short, long, default_value_t = String::from("dense5x5x5.json"))]
     pub out_file: String,
+
+    /// Debugging test
+    #[arg(short, long)]
+    pub limit_ws: Option<u64>,
 }

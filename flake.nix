@@ -36,7 +36,10 @@
             modules = [
               {
                 # https://devenv.sh/reference/options/
-                packages = [ pkgs.hello ];
+                packages = [ 
+                  pkgs.hello 
+                  pkgs.perf
+                ];
 
                 languages.rust = {
                   channel = "nightly";

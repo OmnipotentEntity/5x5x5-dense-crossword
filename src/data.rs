@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, prelude::*, BufRead};
+use std::io::{self, BufRead};
 use std::mem::size_of;
 use std::path::Path;
 
@@ -11,7 +11,9 @@ use heed::{
     byteorder::NativeEndian, types::U32, BoxedError, BytesDecode, BytesEncode, Database, Env,
 };
 use indicatif::ProgressBar;
-use ndarray::{s, Array, Array2, ArrayView1, /*Array3, ArrayView,*/ Axis};
+use ndarray::{s, Array, Array1, Array2, Axis};
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
+use serde_json::Deserializer as JsonDeserializer;
 
 pub const EMPTY_CELL: char = ' ';
 pub const LENGTH: usize = 5;
@@ -19,27 +21,6 @@ const TXN_SIZE: u32 = 1024 * 1024;
 
 pub type PrefixSet = HashMap<Vec<char>, HashSet<u16>>;
 pub type ErrT = Box<dyn Error + Send + Sync>;
-
-#[derive(Debug)]
-pub struct JsonParseError {
-    cause: String,
-}
-
-impl JsonParseError {
-    fn new(cause: String) -> JsonParseError {
-        JsonParseError {
-            cause: String::from(cause),
-        }
-    }
-}
-
-impl fmt::Display for JsonParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unable to read json file: {:?}", self.cause)
-    }
-}
-
-impl Error for JsonParseError {}
 
 pub type Nu32 = U32<NativeEndian>;
 
@@ -109,161 +90,96 @@ impl<'a> BytesDecode<'a> for WordDbEntryCodec {
     }
 }
 
-/// hahaha, this is way too few states, and the wrong states, but that's OK, because this isn't a
-/// real parser.
-#[derive(PartialEq, Eq, Debug)]
-enum JsonReaderState {
-    OuterArray,
-    InnerArray,
-    String,
-}
-
-// The structure of the json file is known, so a Q&D parser is used here
-fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool, char) -> Result<(), ErrT>>(
+pub fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool, char) -> Result<(), ErrT>>(
     json_file: String,
+    records_to_read: Option<u64>,
     insert_record: &mut T,
 ) -> Result<(), ErrT> {
-    let file = File::open(json_file)?;
-    let file_size = file.metadata().unwrap().len();
-    // There are N quoted strings, each separated by commas, that's (N + 3) * N - 1
-    // Finally, each record has an opening brace, closing brace, and trailing comma
+    let file = File::open(&json_file)?;
+    let file_size = file.metadata()?.len();
+
     let record_length = (LENGTH + 3) * LENGTH + 2;
-    // The entire is an opening bracket, followed by any number of records, followed by a closing
-    // bracket
-    // However, the final record does not have a trailing comma; therefore, we have overcounted by
-    // one, so this is actually file_size - 2 + 1
-    let records = (file_size - 1) / (record_length as u64);
+    let records = file_size.saturating_sub(1) / (record_length as u64);
+    let pb = ProgressBar::new(records_to_read.unwrap_or(records));
+
     let buf = io::BufReader::new(file);
+    let mut deserializer = JsonDeserializer::from_reader(buf);
 
-    let mut state_vec: Vec<JsonReaderState> = Vec::new();
-    let mut data_vec: Array2<char> = Array2::from_elem((LENGTH, LENGTH), EMPTY_CELL);
-    let mut data_idx_major: usize = 0;
-    let mut data_idx_minor: usize = 0;
-    let mut db_id: u32 = 0;
+    struct WordSquareVisitor<'a, F> {
+        insert_record: &'a mut F,
+        records_to_read: Option<u64>,
+        pb: ProgressBar,
+    }
 
-    let pb = ProgressBar::new(records);
+    impl<'de, 'a, F> Visitor<'de> for WordSquareVisitor<'a, F>
+    where
+        F: FnMut(Array2<char>, u32, bool, char) -> Result<(), ErrT>,
+    {
+        type Value = ();
 
-    let mut last_top_left = ' ';
-    let mut top_left_changed = false;
-
-    for byte in buf.bytes() {
-        if byte.is_err() {
-            break;
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a JSON array of 5x5 character squares")
         }
 
-        let ascii = byte? as char;
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut db_id: u32 = 0;
+            let mut last_top_left: Option<char> = None;
 
-        match ascii {
-            '[' => match state_vec.last() {
-                None => state_vec.push(JsonReaderState::OuterArray),
-                Some(JsonReaderState::OuterArray) => state_vec.push(JsonReaderState::InnerArray),
-                _ => {
-                    return Err(Box::new(JsonParseError::new(format!(
-                        "Wrong state when reading open bracket: {:?}",
-                        state_vec.last()
-                    ))));
-                }
-            },
+            while let Some(row_strings) = seq.next_element::<[String; LENGTH]>()? {
+                let mut data_vec = Array2::from_elem((LENGTH, LENGTH), EMPTY_CELL);
 
-            ',' => match state_vec.last() {
-                Some(JsonReaderState::OuterArray) => {
-                    data_idx_major = 0;
-                    data_idx_minor = 0;
-                }
-                Some(JsonReaderState::InnerArray) => {
-                    data_idx_minor = 0;
-                }
-                _ => {
-                    return Err(Box::new(JsonParseError::new(format!(
-                        "Wrong state when reading comma: {:?}",
-                        state_vec.last()
-                    ))));
-                }
-            },
-
-            ']' => match state_vec.last() {
-                Some(JsonReaderState::OuterArray) => {
-                    break;
-                }
-                Some(JsonReaderState::InnerArray) => {
-                    if data_idx_major != LENGTH {
-                        return Err(Box::new(JsonParseError::new(format!(
-                            "Wrong number of elements in inner array: expected {}, got {}",
-                            LENGTH, data_idx_major
-                        ))));
-                    };
-
-                    insert_record(data_vec.clone(), db_id, top_left_changed, last_top_left)?;
-                    db_id += 1;
-                    pb.inc(1);
-                    state_vec.pop();
-                }
-                _ => {
-                    return Err(Box::new(JsonParseError::new(format!(
-                        "Wrong state when reading close bracket: {:?}",
-                        state_vec.last()
-                    ))));
-                }
-            },
-
-            '"' => match state_vec.last() {
-                Some(JsonReaderState::InnerArray) => {
-                    state_vec.push(JsonReaderState::String);
-                }
-                Some(JsonReaderState::String) => {
-                    if data_idx_minor != LENGTH {
-                        return Err(Box::new(JsonParseError::new(format!(
-                            "Wrong number of elements in string: expected {}, got {}",
-                            LENGTH, data_idx_minor
-                        ))));
+                for (r, row) in row_strings.iter().enumerate() {
+                    let chars: Vec<char> = row.chars().collect();
+                    if chars.len() != LENGTH {
+                        return Err(de::Error::custom(format!(
+                            "Row length mismatch at index {}: expected {}, got {}",
+                            db_id, LENGTH, chars.len()
+                        )));
                     }
-                    data_idx_major += 1;
-                    state_vec.pop();
-                }
-                _ => {
-                    return Err(Box::new(JsonParseError::new(format!(
-                        "Wrong state when reading quote: {:?}",
-                        state_vec.last()
-                    ))));
-                }
-            },
-
-            x @ 'a'..='z' => {
-                if state_vec.last() == Some(&JsonReaderState::String) {
-                    // Ensure that the database is sorted by the top left value.
-                    if (data_idx_major, data_idx_minor) == (0, 0) {
-                        if x < last_top_left {
-                            return Err(Box::new(JsonParseError::new(format!(
-                                "Json is not sorted at index {}: {} < {}",
-                                db_id, x, last_top_left
-                            ))));
-                        } else if x != last_top_left {
-                            last_top_left = x;
-                            top_left_changed = true;
-                        } else {
-                            top_left_changed = false;
-                        }
+                    for (c, &ch) in chars.iter().enumerate() {
+                        data_vec[(r, c)] = ch;
                     }
-                    data_vec[(data_idx_major, data_idx_minor)] = x;
-                    data_idx_minor += 1;
-                } else {
-                    return Err(Box::new(JsonParseError::new(format!(
-                        "Wrong state when reading characters: {:?}",
-                        state_vec.last()
-                    ))));
+                }
+
+                let top_left = data_vec[(0, 0)];
+                let top_left_changed = match last_top_left {
+                    Some(last) if top_left < last => {
+                        return Err(de::Error::custom(format!(
+                            "JSON is not sorted at index {}: '{}' < '{}'",
+                            db_id, top_left, last
+                        )));
+                    }
+                    Some(last) => top_left != last,
+                    None => true,
+                };
+                last_top_left = Some(top_left);
+
+                (self.insert_record)(data_vec, db_id, top_left_changed, top_left)
+                    .map_err(de::Error::custom)?;
+
+                self.pb.inc(1);
+                db_id += 1;
+
+                if let Some(limit) = self.records_to_read {
+                    if db_id as u64 >= limit {
+                        break;
+                    }
                 }
             }
-
-            x if x.is_whitespace() => {}
-
-            x => {
-                return Err(Box::new(JsonParseError::new(format!(
-                    "Unexpected character: '{}'",
-                    x
-                ))));
+           
+            // If we went out early, drain the rest of the records
+            while let Some(_) = seq.next_element::<[String; LENGTH]>()? {
+                self.pb.inc(1);
             }
-        };
+
+            Ok(())
+        }
     }
+
+    deserializer.deserialize_seq(WordSquareVisitor { insert_record, records_to_read, pb })?;
 
     Ok(())
 }
@@ -273,25 +189,29 @@ pub fn copy_json_to_database(
     word_square_db: &mut Database<Nu32, WordDbEntryCodec>,
     env: &Env,
     words: &Array2<char>,
+    records_to_read: Option<u64>,
 ) -> Result<Vec<u32>, ErrT> {
     let mut wtxn = Some(env.write_txn()?);
 
     let mut changes = [0; 26];
 
-    read_json_with_visitor(json_file, &mut |data: Array2<char>,
+    let reverse_word_map = create_reverse_word_map(words);
+
+    read_json_with_visitor(json_file, records_to_read, &mut |data: Array2<char>,
                                             id,
                                             top_left_changed,
                                             top_left|
      -> Result<(), ErrT> {
         let word_db_entry = WordDbEntry {
             word_square: data.clone(),
-            word_square_words: words_in_square(&data, words).unwrap(),
+            word_square_words: words_in_square(&data, &reverse_word_map).unwrap(),
         };
-        let mut txn = wtxn.take().expect("transaction should exist");
+        let txn = wtxn.as_mut().expect("transaction should exist");
 
-        word_square_db.put(&mut txn, &id, &word_db_entry)?;
+        word_square_db.put(txn, &id, &word_db_entry)?;
 
         if (id + 1) % TXN_SIZE == 0 {
+            let txn = wtxn.take().expect("transaction should exist");
             txn.commit()?;
             wtxn = Some(env.write_txn()?);
         }
@@ -308,39 +228,17 @@ pub fn copy_json_to_database(
     Ok(Vec::from(changes))
 }
 
-fn words_in_square(ws: &Array2<char>, words: &Array2<char>) -> Result<HashSet<u16>, ErrT> {
+fn words_in_square(ws: &Array2<char>, reverse_word_map: &HashMap<Array1<char>, u16>) -> Result<HashSet<u16>, ErrT> {
     let mut result = HashSet::new();
     for i in 0..=1 {
         for word in ws.axis_iter(Axis(i)) {
-            result.insert(binary_search_words(word, words)?);
+            result.insert(*reverse_word_map.get(&word.to_owned()).expect("word not found"));
         }
     }
 
     assert!(result.len() == 2 * LENGTH);
 
     Ok(result)
-}
-
-pub fn binary_search_words(word: ArrayView1<char>, words: &Array2<char>) -> Result<u16, ErrT> {
-    // binary search
-    let mut low = 0;
-    let mut high = words.shape()[0];
-
-    while low <= high {
-        let mid = (low + high) / 2;
-        if words.slice(s![mid, ..]) == word {
-            return Ok(mid as u16);
-        } else if word.iter().cmp(words.slice(s![mid, ..]).iter()) == std::cmp::Ordering::Less {
-            high = mid - 1;
-        } else {
-            low = mid + 1;
-        }
-    }
-
-    // could not find word in list
-    return Err(Box::new(JsonParseError::new(
-        "Unable to find word in list".into(),
-    )));
 }
 
 /// Words are assumed sorted
@@ -358,6 +256,15 @@ pub fn read_words_from_file(file: String) -> Array2<char> {
     }
 
     Array2::from_shape_vec((count, LENGTH), raw_data).unwrap()
+}
+
+fn create_reverse_word_map(words: &Array2<char>) -> HashMap<Array1<char>, u16> {
+    let mut result = HashMap::new();
+    for i in 0..words.shape()[0] {
+        result.insert(words.slice(s![i, ..]).to_owned(), i as u16);
+    }
+
+    result
 }
 
 pub fn generate_prefixes_from_words(words: &Array2<char>) -> PrefixSet {
