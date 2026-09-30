@@ -19,7 +19,7 @@ fn main() -> Result<(), ErrT> {
 
     let env = unsafe {
         EnvOpenOptions::new()
-            .map_size(100 * 1024 * 1024 * 1024) // 100 GiB
+            .map_size(200 * 1024 * 1024 * 1024) // 100 GiB
             .max_dbs(1)
             .open(path)?
     };
