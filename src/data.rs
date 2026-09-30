@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, BinaryHeap};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -50,6 +50,9 @@ impl<'a> BytesEncode<'a> for WordDbEntryCodec {
             &mut entry
                 .word_square_words
                 .iter()
+                // collect to binary heap first, in order to have a stable binary representation
+                .collect::<BinaryHeap<_>>()
+                .into_iter()
                 .map(|x| x.to_ne_bytes())
                 .flatten()
                 .collect::<Vec<_>>(),
