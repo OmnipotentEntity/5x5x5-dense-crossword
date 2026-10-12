@@ -15,7 +15,7 @@ pub struct Args {
     #[arg(short, long, default_value_t = String::from("dense5x5x5.json"))]
     pub out_file: String,
 
-    /// Debugging test
-    #[arg(short, long)]
-    pub limit_ws: Option<u64>,
+    /// Database
+    #[arg(short, long, default_value_t = String::from("ws.lmdb"))]
+    pub db_file: String
 }

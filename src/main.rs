@@ -3,7 +3,6 @@ use std::sync::Arc;
 use clap::Parser;
 use heed::{Database, EnvOpenOptions};
 // use ndarray::Array3;
-use tempfile;
 
 mod args;
 mod data;
@@ -15,13 +14,13 @@ use crate::solve::solve_word_cubes;
 
 fn main() -> Result<(), ErrT> {
     let cli = args::Args::parse();
-    let path = tempfile::tempdir().expect("Could not create tempdir");
+    let path = cli.db_file;
 
     let env = unsafe {
         EnvOpenOptions::new()
             .map_size(200 * 1024 * 1024 * 1024) // 100 GiB
             .max_dbs(1)
-            .open(path)?
+            .open(std::path::Path::new(&path))?
     };
 
     let mut wtxn = env.write_txn()?;
@@ -35,7 +34,7 @@ fn main() -> Result<(), ErrT> {
     let words = read_words_from_file(cli.word_file);
     println!("Done");
     println!("Reading squares from json");
-    let db_index = copy_json_to_database(cli.json_file, &mut word_square_db, &env, &words, cli.limit_ws)?;
+    let db_index = copy_json_to_database(cli.json_file, &mut word_square_db, &env, &words)?;
     println!("Done");
 
     let result = solve_word_cubes(words, Arc::new(word_square_db), &env, db_index)?;

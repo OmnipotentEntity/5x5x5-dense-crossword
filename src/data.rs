@@ -95,7 +95,6 @@ impl<'a> BytesDecode<'a> for WordDbEntryCodec {
 
 pub fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool, char) -> Result<(), ErrT>>(
     json_file: String,
-    records_to_read: Option<u64>,
     insert_record: &mut T,
 ) -> Result<(), ErrT> {
     let file = File::open(&json_file)?;
@@ -103,14 +102,13 @@ pub fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool, char) -> Result<
 
     let record_length = (LENGTH + 3) * LENGTH + 2;
     let records = file_size.saturating_sub(1) / (record_length as u64);
-    let pb = ProgressBar::new(records_to_read.unwrap_or(records));
+    let pb = ProgressBar::new(records);
 
     let buf = io::BufReader::new(file);
     let mut deserializer = JsonDeserializer::from_reader(buf);
 
     struct WordSquareVisitor<'a, F> {
         insert_record: &'a mut F,
-        records_to_read: Option<u64>,
         pb: ProgressBar,
     }
 
@@ -165,12 +163,6 @@ pub fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool, char) -> Result<
 
                 self.pb.inc(1);
                 db_id += 1;
-
-                if let Some(limit) = self.records_to_read {
-                    if db_id as u64 >= limit {
-                        break;
-                    }
-                }
             }
            
             // If we went out early, drain the rest of the records
@@ -182,7 +174,7 @@ pub fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool, char) -> Result<
         }
     }
 
-    deserializer.deserialize_seq(WordSquareVisitor { insert_record, records_to_read, pb })?;
+    deserializer.deserialize_seq(WordSquareVisitor { insert_record, pb })?;
 
     Ok(())
 }
@@ -192,7 +184,6 @@ pub fn copy_json_to_database(
     word_square_db: &mut Database<Nu32, WordDbEntryCodec>,
     env: &Env,
     words: &Array2<char>,
-    records_to_read: Option<u64>,
 ) -> Result<Vec<u32>, ErrT> {
     let mut wtxn = Some(env.write_txn()?);
 
@@ -200,7 +191,7 @@ pub fn copy_json_to_database(
 
     let reverse_word_map = create_reverse_word_map(words);
 
-    read_json_with_visitor(json_file, records_to_read, &mut |data: Array2<char>,
+    read_json_with_visitor(json_file, &mut |data: Array2<char>,
                                             id,
                                             top_left_changed,
                                             top_left|
