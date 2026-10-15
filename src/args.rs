@@ -16,6 +16,6 @@ pub struct Args {
     pub out_file: String,
 
     /// Database
-    #[arg(short, long, default_value_t = String::from("ws.lmdb"))]
-    pub db_file: String
+    #[arg(short, long, default_value_t = String::from("ws.db"))]
+    pub db_folder: String,
 }

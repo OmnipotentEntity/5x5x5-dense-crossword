@@ -1,99 +1,151 @@
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, BinaryHeap};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::fs::File;
-use std::io::{self, BufRead};
-use std::mem::size_of;
+use std::fs::{exists, read_to_string, remove_file, File};
+use std::io::{self, BufRead, Write};
+use std::mem::MaybeUninit;
 use std::path::Path;
+use std::sync::Arc;
 
-use heed::{
-    byteorder::NativeEndian, types::U32, BoxedError, BytesDecode, BytesEncode, Database, Env,
-};
 use indicatif::ProgressBar;
-use ndarray::{s, Array, Array1, Array2, Axis};
+use memmap2::{Mmap, MmapOptions};
+use ndarray::{s, Array1, Array2, ArrayView2, Axis};
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde_json::Deserializer as JsonDeserializer;
 
-pub const EMPTY_CELL: char = ' ';
+pub const EMPTY_CELL: u8 = ' ' as u8;
 pub const LENGTH: usize = 5;
-const TXN_SIZE: u32 = 1024 * 1024;
+const LOCK_FILE_NAME: &str = "db.lock";
+const FLAG_FILE_NAME : &str = "db.flag";
+const DATABASE_FILE_NAME: &str = "db.db";
+const LETTERS: usize = 26;
 
-pub type PrefixSet = HashMap<Vec<char>, HashSet<u16>>;
+const SQUARE_LEN: usize = LENGTH * LENGTH * std::mem::size_of::<u8>();
+const HASH_LEN: usize = 2 * LENGTH * std::mem::size_of::<u16>();
+const TOTAL_LEN: usize = SQUARE_LEN + HASH_LEN;
+const TXN_SIZE: usize = 1024 * 1024;
+const BUF_LEN: usize = TOTAL_LEN * TXN_SIZE;
+
+pub type PrefixSet = HashMap<Vec<u8>, Vec<u16>>;
 pub type ErrT = Box<dyn Error + Send + Sync>;
 
-pub type Nu32 = U32<NativeEndian>;
-
-/// The thing that we actually store inside of the database
-pub struct WordDbEntry {
-    pub word_square: Array2<char>,
-    /// Contains indices into the words array for each words in the word square
-    /// Indices are compressed to u16 to save space
-    pub word_square_words: HashSet<u16>,
+pub struct WordDb {
+    pub db: Arc<Mmap>,
+    pub changes: [usize; LETTERS],
+    pub count: usize,
+    db_file: File,
+    lock_file: File,
+    db_folder: String,
 }
 
-pub struct WordDbEntryCodec;
-
-impl<'a> BytesEncode<'a> for WordDbEntryCodec {
-    type EItem = WordDbEntry;
-
-    fn bytes_encode(entry: &Self::EItem) -> Result<Cow<'a, [u8]>, BoxedError> {
-        let mut result = Vec::new();
-        result.append(
-            &mut entry
-                .word_square
-                .iter()
-                .map(|x| *x as u8)
-                .collect::<Vec<_>>(),
-        );
-        result.append(
-            &mut entry
-                .word_square_words
-                .iter()
-                // collect to binary heap first, in order to have a stable binary representation
-                .collect::<BinaryHeap<_>>()
-                .into_iter()
-                .map(|x| x.to_ne_bytes())
-                .flatten()
-                .collect::<Vec<_>>(),
-        );
-
-        Ok(Cow::Owned(result))
-    }
-}
-
-impl<'a> BytesDecode<'a> for WordDbEntryCodec {
-    type DItem = WordDbEntry;
-
-    fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem, BoxedError> {
-        let ws = match bytes.get(..LENGTH * LENGTH) {
-            Some(bytes) => Array::from_iter(bytes.iter().map(|x| *x as char))
-                .into_shape_with_order((LENGTH, LENGTH))
-                .unwrap(),
-            None => return Err("invalid db entry".into()),
-        };
-
-        let wsw = match bytes.get(LENGTH * LENGTH..) {
-            Some(bytes) => {
-                if bytes.len() != size_of::<u16>() * 2 * LENGTH {
-                    return Err("invalid db entry".into());
-                };
-                bytes
-                    .chunks(2)
-                    .map(|x| u16::from_ne_bytes([x[0], x[1]]))
-                    .collect()
-            }
-            None => return Err("invalid db entry".into()),
-        };
-
-        Ok(WordDbEntry {
-            word_square: ws,
-            word_square_words: wsw,
+impl WordDb {
+    pub fn new(db_folder: String) -> Result<WordDb, ErrT> {
+        let db_folder_string = db_folder.clone();
+        let db_folder = Path::new(&db_folder);
+        let lock_file = File::create(db_folder.join(LOCK_FILE_NAME))?;
+        lock_file.try_lock()?;
+        let (count, changes) = parse_flag_file(&db_folder_string)?;
+        let db_file = File::open(db_folder.join(DATABASE_FILE_NAME)).map_err(|e| Box::new(e))?;
+        let db = Arc::new(unsafe {
+            MmapOptions::new()
+                .huge(Some(21))
+                .no_reserve_swap()
+                .map(&db_file)
+        }?);
+        Ok(WordDb {
+            db: db,
+            db_file: db_file,
+            lock_file: lock_file,
+            db_folder: db_folder_string,
+            count: count,
+            changes: changes,
         })
     }
+
+    fn drop(&mut self) {
+        self.lock_file.unlock().unwrap();
+        remove_file(Path::new(&self.db_folder).join(LOCK_FILE_NAME)).unwrap();
+    }
+
+    pub fn get(&self, idx: usize) -> Option<WordDbEntry<'_>> {
+        if idx <= self.count {
+            Some(WordDbEntry::deserialize(&self.db, idx * TOTAL_LEN))
+        } else {
+            None
+        }
+    }
 }
 
-pub fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool, char) -> Result<(), ErrT>>(
+fn word_square_view(word_square: &[u8]) -> ArrayView2<'_, u8> {
+    ArrayView2::from_shape((LENGTH, LENGTH), word_square).unwrap()
+}
+
+/// Reduces one copy during construction of database
+pub struct WordDbEntry<'a> {
+    pub word_square: &'a [u8; LENGTH*LENGTH],
+    pub word_square_words: &'a [u16; 2*LENGTH],
+}
+
+impl<'a> WordDbEntry<'a> {
+    // For speed, we directly copy raw bits to and fro with very little consistency checking
+    pub fn serialize(&self, target: &mut [u8], offset: usize) {
+        target[offset..offset + SQUARE_LEN].copy_from_slice(self.word_square);
+
+        // We do not consider endianess
+        let ptr: *const u8 = self.word_square_words.as_ptr().cast();
+        target[offset + SQUARE_LEN..offset + TOTAL_LEN]
+            .copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, HASH_LEN) });
+    }
+
+    pub fn deserialize(source: &[u8], offset: usize) -> WordDbEntry<'_> {
+        let mut result: MaybeUninit<WordDbEntry> = MaybeUninit::uninit();
+        let ptr = result.as_mut_ptr();
+
+        unsafe {
+            (&raw mut (*ptr).word_square)
+                .write(source[offset..offset + SQUARE_LEN].try_into().unwrap());
+            // We do not consider endianess
+            (&raw mut (*ptr).word_square_words).cast::<&[u8]>().write(
+                source[offset + SQUARE_LEN..offset + TOTAL_LEN]
+                    .try_into()
+                    .unwrap(),
+            );
+        }
+
+        unsafe { result.assume_init() }
+    }
+
+    pub fn word_square_view(&self) -> ArrayView2<'_, u8> {
+        word_square_view(self.word_square)
+    }
+}
+
+#[derive(Debug)]
+pub struct DbErr {
+    pub reason: String,
+}
+
+impl DbErr {
+    fn new(reason: &str) -> DbErr {
+        DbErr {
+            reason: String::from(reason),
+        }
+    }
+}
+
+impl fmt::Display for DbErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DbErr: {}", self.reason)
+    }
+}
+
+impl Error for DbErr {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        None
+    }
+}
+
+pub fn read_json_with_visitor<T: FnMut(&[u8; LENGTH*LENGTH], u32, bool, u8) -> Result<(), ErrT>>(
     json_file: String,
     insert_record: &mut T,
 ) -> Result<(), ErrT> {
@@ -114,7 +166,7 @@ pub fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool, char) -> Result<
 
     impl<'de, 'a, F> Visitor<'de> for WordSquareVisitor<'a, F>
     where
-        F: FnMut(Array2<char>, u32, bool, char) -> Result<(), ErrT>,
+        F: FnMut(&[u8; LENGTH*LENGTH], u32, bool, u8) -> Result<(), ErrT>,
     {
         type Value = ();
 
@@ -127,25 +179,30 @@ pub fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool, char) -> Result<
             A: SeqAccess<'de>,
         {
             let mut db_id: u32 = 0;
-            let mut last_top_left: Option<char> = None;
+            let mut last_top_left: Option<u8> = None;
 
             while let Some(row_strings) = seq.next_element::<[String; LENGTH]>()? {
-                let mut data_vec = Array2::from_elem((LENGTH, LENGTH), EMPTY_CELL);
+                let mut data_vec: [MaybeUninit<u8>; LENGTH * LENGTH] =
+                    [const { MaybeUninit::uninit() }; LENGTH * LENGTH];
 
                 for (r, row) in row_strings.iter().enumerate() {
-                    let chars: Vec<char> = row.chars().collect();
+                    let chars: Vec<u8> = row.chars().map(|x| x as u8).collect();
                     if chars.len() != LENGTH {
                         return Err(de::Error::custom(format!(
                             "Row length mismatch at index {}: expected {}, got {}",
-                            db_id, LENGTH, chars.len()
+                            db_id,
+                            LENGTH,
+                            chars.len()
                         )));
                     }
                     for (c, &ch) in chars.iter().enumerate() {
-                        data_vec[(r, c)] = ch;
+                        data_vec[r * LENGTH + c].write(ch);
                     }
                 }
 
-                let top_left = data_vec[(0, 0)];
+                let data_vec = unsafe { std::mem::transmute::<_, [u8; LENGTH * LENGTH]>(data_vec) };
+
+                let top_left = data_vec[0];
                 let top_left_changed = match last_top_left {
                     Some(last) if top_left < last => {
                         return Err(de::Error::custom(format!(
@@ -158,13 +215,13 @@ pub fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool, char) -> Result<
                 };
                 last_top_left = Some(top_left);
 
-                (self.insert_record)(data_vec, db_id, top_left_changed, top_left)
+                (self.insert_record)(&data_vec, db_id, top_left_changed, top_left)
                     .map_err(de::Error::custom)?;
 
                 self.pb.inc(1);
                 db_id += 1;
             }
-           
+
             // If we went out early, drain the rest of the records
             while let Some(_) = seq.next_element::<[String; LENGTH]>()? {
                 self.pb.inc(1);
@@ -179,35 +236,89 @@ pub fn read_json_with_visitor<T: FnMut(Array2<char>, u32, bool, char) -> Result<
     Ok(())
 }
 
+fn parse_flag_file(db_folder: &String) -> Result<(usize, [usize; LETTERS]), ErrT> {
+    let mut changes = [0; LETTERS];
+
+    let flag_file = Path::new(db_folder).join(FLAG_FILE_NAME);
+    let file_string = read_to_string(flag_file).unwrap();
+    let mut file_iter = file_string.lines();
+    let count = match file_iter.next() {
+        Some(line) => line.parse()?,
+        None => return Err(Box::new(DbErr::new("Invalid complete file. Empty file."))),
+    };
+
+    let mut i = 0;
+    // read the changes from the file
+    for line in file_iter {
+        if i >= LETTERS {
+            return Err(Box::new(DbErr::new("Invalid complete file. Too many changes.")));
+        }
+        changes[i] = line.parse()?;
+        i += 1;
+    }
+
+    if i != LETTERS {
+        return Err(Box::new(DbErr::new("Invalid complete file. Not enough changes.")));
+    }
+
+    return Ok((count, changes));
+}
+
 pub fn copy_json_to_database(
     json_file: String,
-    word_square_db: &mut Database<Nu32, WordDbEntryCodec>,
-    env: &Env,
-    words: &Array2<char>,
-) -> Result<Vec<u32>, ErrT> {
-    let mut wtxn = Some(env.write_txn()?);
-
-    let mut changes = [0; 26];
-
+    db_folder: String,
+    words: &Array2<u8>,
+) -> Result<(), ErrT> {
+    let mut changes = [0; LETTERS];
     let reverse_word_map = create_reverse_word_map(words);
 
-    read_json_with_visitor(json_file, &mut |data: Array2<char>,
+    // If we have an already running process
+    let lock_file = Path::new(&db_folder).join(LOCK_FILE_NAME);
+    if exists(&lock_file)? {
+        return Err(Box::new(DbErr::new("Lock file exists")));
+    }
+
+    // Note, there is a race condition here, but this is a personal project, so I'm not really
+    // worried about it
+
+    let lock_file = File::create(lock_file)?;
+    lock_file.try_lock()?;
+
+    // If we already have done this
+    let flag_file = Path::new(&db_folder).join(FLAG_FILE_NAME);
+    if exists(&flag_file)? {
+        return Ok(());
+    }
+
+
+    let database_file = Path::new(&db_folder).join(DATABASE_FILE_NAME);
+    let mut db_file_handle = File::create(database_file)?;
+    let mut write_buffer: [u8; BUF_LEN] = [0; BUF_LEN];
+    let mut idx: usize = 0;
+    let mut count: usize = 0;
+
+    read_json_with_visitor(json_file, &mut |data: &[u8; LENGTH*LENGTH],
                                             id,
                                             top_left_changed,
                                             top_left|
      -> Result<(), ErrT> {
+        let offset = idx * TOTAL_LEN;
+        let wsw = words_in_square(data, &reverse_word_map).unwrap();
         let word_db_entry = WordDbEntry {
-            word_square: data.clone(),
-            word_square_words: words_in_square(&data, &reverse_word_map).unwrap(),
+            word_square: data,
+            word_square_words: &wsw,
         };
-        let txn = wtxn.as_mut().expect("transaction should exist");
 
-        word_square_db.put(txn, &id, &word_db_entry)?;
+        word_db_entry.serialize(&mut write_buffer, offset);
+        idx += 1;
+        count += 1;
 
-        if (id + 1) % TXN_SIZE == 0 {
-            let txn = wtxn.take().expect("transaction should exist");
-            txn.commit()?;
-            wtxn = Some(env.write_txn()?);
+        if offset >= BUF_LEN {
+            let num_bytes = db_file_handle.write(&write_buffer)?;
+            if num_bytes != BUF_LEN {
+                return Err(Box::new(DbErr::new("Could not write to disk")));
+            }
+            idx = 0;
         }
 
         if top_left_changed {
@@ -217,33 +328,61 @@ pub fn copy_json_to_database(
         Ok(())
     })?;
 
-    wtxn.unwrap().commit()?;
+    // Need to finish writing to file
+    db_file_handle.write(&write_buffer[0..idx*TOTAL_LEN])?;
+    db_file_handle.flush()?;
 
-    Ok(Vec::from(changes))
+    // Write the flag file
+    let mut flag_file = File::create(flag_file)?;
+
+    writeln!(flag_file, "{}", count)?;
+
+    for i in 0..LETTERS {
+        writeln!(flag_file, "{}", changes[i].to_string())?;
+    }
+
+    // remove lock file
+    lock_file.unlock()?;
+    remove_file(Path::new(&db_folder).join(LOCK_FILE_NAME))?;
+
+    Ok(())
 }
 
-fn words_in_square(ws: &Array2<char>, reverse_word_map: &HashMap<Array1<char>, u16>) -> Result<HashSet<u16>, ErrT> {
-    let mut result = HashSet::new();
+fn words_in_square(
+    ws: &[u8],
+    reverse_word_map: &HashMap<Array1<u8>, u16>,
+) -> Result<[u16; 2 * LENGTH], ErrT> {
+    let mut result = [const { MaybeUninit::uninit() }; 2 * LENGTH];
+    let mut idx = 0;
+    let ws = word_square_view(ws);
     for i in 0..=1 {
         for word in ws.axis_iter(Axis(i)) {
-            result.insert(*reverse_word_map.get(&word.to_owned()).expect("word not found"));
+            result[idx].write(
+                *reverse_word_map
+                    .get(&word.to_owned())
+                    .expect("word not found"),
+            );
+            idx += 1;
         }
     }
 
-    assert!(result.len() == 2 * LENGTH);
+    assert!(idx == 2 * LENGTH);
+
+    let mut result = unsafe { std::mem::transmute::<_, [u16; 2 * LENGTH]>(result) };
+    result.sort();
 
     Ok(result)
 }
 
 /// Words are assumed sorted
-pub fn read_words_from_file(file: String) -> Array2<char> {
+pub fn read_words_from_file(file: String) -> Array2<u8> {
     let mut raw_data = Vec::new();
     let mut count = 0;
     if let Ok(lines) = read_lines(file) {
         for line in lines.map_while(Result::ok) {
             let line = line.trim().to_ascii_lowercase();
-            if line.chars().count() == LENGTH {
-                raw_data.extend(line.chars());
+            if line.len() == LENGTH && line.is_ascii() {
+                raw_data.extend(line.as_bytes());
                 count += 1;
             }
         }
@@ -252,7 +391,7 @@ pub fn read_words_from_file(file: String) -> Array2<char> {
     Array2::from_shape_vec((count, LENGTH), raw_data).unwrap()
 }
 
-fn create_reverse_word_map(words: &Array2<char>) -> HashMap<Array1<char>, u16> {
+fn create_reverse_word_map(words: &Array2<u8>) -> HashMap<Array1<u8>, u16> {
     let mut result = HashMap::new();
     for i in 0..words.shape()[0] {
         result.insert(words.slice(s![i, ..]).to_owned(), i as u16);
@@ -261,8 +400,8 @@ fn create_reverse_word_map(words: &Array2<char>) -> HashMap<Array1<char>, u16> {
     result
 }
 
-pub fn generate_prefixes_from_words(words: &Array2<char>) -> PrefixSet {
-    let mut result: HashMap<Vec<char>, HashSet<u16>> = HashMap::new();
+pub fn generate_prefixes_from_words(words: &Array2<u8>) -> PrefixSet {
+    let mut result: PrefixSet = HashMap::new();
     for (word_id, word) in words.axis_iter(Axis(0)).enumerate() {
         for i in 0..LENGTH {
             let key_vec = word
@@ -270,9 +409,13 @@ pub fn generate_prefixes_from_words(words: &Array2<char>) -> PrefixSet {
                 .to_owned()
                 .into_iter()
                 .collect::<Vec<_>>();
-            let val = result.entry(key_vec).or_insert(HashSet::new());
-            val.insert(word_id as u16);
+            let val = result.entry(key_vec).or_insert(Vec::new());
+            val.push(word_id as u16);
         }
+    }
+
+    for (_, v) in result.iter_mut() {
+        v.sort();
     }
 
     result

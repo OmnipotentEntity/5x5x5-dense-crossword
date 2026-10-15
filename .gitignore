@@ -13,3 +13,10 @@ devenv.local.yaml
 
 # pre-commit
 .pre-commit-config.yaml
+
+# 66GB word square file
+scrabble.json
+
+# database file
+ws.db
+ws.complete
