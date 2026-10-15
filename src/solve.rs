@@ -2,9 +2,11 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 use std::thread::{self, available_parallelism};
 
-use ndarray::{concatenate, s, stack, ArrayView1, Array2, Array3, Array4, Axis};
+use ndarray::{concatenate, s, stack, Array2, Array3, Array4, ArrayView1, Axis};
 
-use crate::data::{generate_prefixes_from_words, ErrT, PrefixSet, WordDb, WordDbEntry, EMPTY_CELL, LENGTH};
+use crate::data::{
+    generate_prefixes_from_words, ErrT, PrefixSet, WordDb, WordDbEntry, EMPTY_CELL, LENGTH,
+};
 
 /// This function generates all of the word cubes using the squares in word_square_db
 /// word_square_db is assumed sorted by key, where the sorting function is only concerned with the
@@ -229,9 +231,13 @@ fn try_place_word_square(
 
     // If we have no conflicts
     // actually write into the word cube and signal that we did
-    wcd.word_cube
-        .index_axis_mut(Axis(0), depth)
-        .assign(&wdb.word_square_view());
+    let wsv = wdb.word_square_view();
+    let mut target = wcd.word_cube.index_axis_mut(Axis(0), depth);
+    if !transpose {
+        target.assign(&wsv)
+    } else {
+        target.assign(&wsv.reversed_axes())
+    }
 
     true
 }
@@ -269,20 +275,23 @@ fn is_subset<T: Ord>(a: &Vec<T>, b: &Vec<T>) -> bool {
         let b_val = &b[j];
 
         match a_val.cmp(b_val) {
-            Ordering::Equal => { i += 1; j += 1 },
+            Ordering::Equal => {
+                i += 1;
+                j += 1
+            }
             Ordering::Less => i += 1,
             Ordering::Greater => return false,
         }
     }
 
-    true
+    j == b.len()
 }
 
 fn is_disjoint<T: Ord>(a: &[T], b: &[T]) -> bool {
     let mut i = 0;
     let mut j = 0;
 
-    while i < a.len() || j < b.len() {
+    while i < a.len() && j < b.len() {
         let a_val = &a[i];
         let b_val = &b[j];
 

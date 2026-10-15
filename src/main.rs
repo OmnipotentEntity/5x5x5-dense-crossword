@@ -7,8 +7,8 @@ mod args;
 mod data;
 mod solve;
 
-use crate::data::{ErrT, WordDb};
 use crate::data::{copy_json_to_database, read_words_from_file};
+use crate::data::{ErrT, WordDb};
 use crate::solve::solve_word_cubes;
 
 fn main() -> Result<(), ErrT> {

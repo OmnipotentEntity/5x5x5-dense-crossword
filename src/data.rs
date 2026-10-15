@@ -17,13 +17,14 @@ use serde_json::Deserializer as JsonDeserializer;
 pub const EMPTY_CELL: u8 = ' ' as u8;
 pub const LENGTH: usize = 5;
 const LOCK_FILE_NAME: &str = "db.lock";
-const FLAG_FILE_NAME : &str = "db.flag";
+const FLAG_FILE_NAME: &str = "db.flag";
 const DATABASE_FILE_NAME: &str = "db.db";
 const LETTERS: usize = 26;
 
 const SQUARE_LEN: usize = LENGTH * LENGTH * std::mem::size_of::<u8>();
+const PADDING_LEN: usize = SQUARE_LEN % std::mem::size_of::<u16>();
 const HASH_LEN: usize = 2 * LENGTH * std::mem::size_of::<u16>();
-const TOTAL_LEN: usize = SQUARE_LEN + HASH_LEN;
+const TOTAL_LEN: usize = SQUARE_LEN + PADDING_LEN + HASH_LEN;
 const TXN_SIZE: usize = 1024 * 1024;
 const BUF_LEN: usize = TOTAL_LEN * TXN_SIZE;
 
@@ -75,7 +76,6 @@ impl Drop for WordDb {
         self.lock_file.unlock().unwrap();
         remove_file(Path::new(&self.db_folder).join(LOCK_FILE_NAME)).unwrap();
     }
-
 }
 
 fn word_square_view(word_square: &[u8]) -> ArrayView2<'_, u8> {
@@ -84,27 +84,28 @@ fn word_square_view(word_square: &[u8]) -> ArrayView2<'_, u8> {
 
 /// Reduces one copy during construction of database
 pub struct WordDbEntry<'a> {
-    pub word_square: &'a [u8; LENGTH*LENGTH],
-    pub word_square_words: &'a [u16; 2*LENGTH],
+    pub word_square: &'a [u8; LENGTH * LENGTH],
+    pub word_square_words: &'a [u16; 2 * LENGTH],
 }
 
 impl<'a> WordDbEntry<'a> {
     // For speed, we directly copy raw bits to and fro with very little consistency checking
     pub fn serialize(&self, target: &mut [u8], offset: usize) {
         target[offset..offset + SQUARE_LEN].copy_from_slice(self.word_square);
+        target[offset + SQUARE_LEN] = 0;
 
         // We do not consider endianess
         let ptr: *const u8 = self.word_square_words.as_ptr().cast();
-        target[offset + SQUARE_LEN..offset + TOTAL_LEN]
+        target[offset + SQUARE_LEN + PADDING_LEN..offset + TOTAL_LEN]
             .copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, HASH_LEN) });
     }
 
     pub fn deserialize(source: &'a [u8], offset: usize) -> WordDbEntry<'a> {
-        let square_bytes: &'a [u8; SQUARE_LEN] = source[offset..offset + SQUARE_LEN]
-            .try_into()
-            .unwrap();
+        let square_bytes: &'a [u8; SQUARE_LEN] =
+            source[offset..offset + SQUARE_LEN].try_into().unwrap();
 
-        let hash_bytes: &'a [u8; HASH_LEN] = source[offset + SQUARE_LEN..offset + TOTAL_LEN]
+        let hash_bytes: &'a [u8; HASH_LEN] = source
+            [offset + SQUARE_LEN + PADDING_LEN..offset + TOTAL_LEN]
             .try_into()
             .unwrap();
 
@@ -147,7 +148,9 @@ impl Error for DbErr {
     }
 }
 
-pub fn read_json_with_visitor<T: FnMut(&[u8; LENGTH*LENGTH], u32, bool, u8) -> Result<(), ErrT>>(
+pub fn read_json_with_visitor<
+    T: FnMut(&[u8; LENGTH * LENGTH], u32, bool, u8) -> Result<(), ErrT>,
+>(
     json_file: String,
     insert_record: &mut T,
 ) -> Result<(), ErrT> {
@@ -168,7 +171,7 @@ pub fn read_json_with_visitor<T: FnMut(&[u8; LENGTH*LENGTH], u32, bool, u8) -> R
 
     impl<'de, 'a, F> Visitor<'de> for WordSquareVisitor<'a, F>
     where
-        F: FnMut(&[u8; LENGTH*LENGTH], u32, bool, u8) -> Result<(), ErrT>,
+        F: FnMut(&[u8; LENGTH * LENGTH], u32, bool, u8) -> Result<(), ErrT>,
     {
         type Value = ();
 
@@ -253,14 +256,18 @@ fn parse_flag_file(db_folder: &String) -> Result<(usize, [usize; LETTERS]), ErrT
     // read the changes from the file
     for line in file_iter {
         if i >= LETTERS {
-            return Err(Box::new(DbErr::new("Invalid complete file. Too many changes.")));
+            return Err(Box::new(DbErr::new(
+                "Invalid complete file. Too many changes.",
+            )));
         }
         changes[i] = line.parse()?;
         i += 1;
     }
 
     if i != LETTERS {
-        return Err(Box::new(DbErr::new("Invalid complete file. Not enough changes.")));
+        return Err(Box::new(DbErr::new(
+            "Invalid complete file. Not enough changes.",
+        )));
     }
 
     return Ok((count, changes));
@@ -292,14 +299,13 @@ pub fn copy_json_to_database(
         return Ok(());
     }
 
-
     let database_file = Path::new(&db_folder).join(DATABASE_FILE_NAME);
     let mut db_file_handle = File::create(database_file)?;
     let mut write_buffer: [u8; BUF_LEN] = [0; BUF_LEN];
     let mut idx: usize = 0;
     let mut count: usize = 0;
 
-    read_json_with_visitor(json_file, &mut |data: &[u8; LENGTH*LENGTH],
+    read_json_with_visitor(json_file, &mut |data: &[u8; LENGTH * LENGTH],
                                             id,
                                             top_left_changed,
                                             top_left|
@@ -331,7 +337,7 @@ pub fn copy_json_to_database(
     })?;
 
     // Need to finish writing to file
-    db_file_handle.write(&write_buffer[0..idx*TOTAL_LEN])?;
+    db_file_handle.write(&write_buffer[0..idx * TOTAL_LEN])?;
     db_file_handle.flush()?;
 
     // Write the flag file
