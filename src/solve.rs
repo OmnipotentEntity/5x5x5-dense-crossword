@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::sync::Arc;
 use std::thread::{self, available_parallelism};
 
@@ -140,13 +141,6 @@ pub fn solve_word_cubes(
     )?
     .to_owned();
 
-    // clean up the database
-    match Arc::into_inner(word_square_db) {
-        Some(word_square_db) => std::mem::drop(word_square_db),
-        _ => unreachable!(),
-    };
-
-
     Ok(result)
 }
 
@@ -249,34 +243,20 @@ fn set_insert<T: Ord + Copy>(dest: &mut Vec<T>, src: &[T; 2 * LENGTH]) {
 
 /// This is not a general set difference function!  This assumes every element in b is also in a.
 fn set_difference<T: Ord>(a: &mut Vec<T>, b: &[T; 2 * LENGTH]) {
-    let mut i = 0;
     let mut j = 0;
-    let mut k = 0;
-    let mut erase = [0; 2 * LENGTH];
-
-    while i < a.len() || j < b.len() {
-        let a_val = &a[i];
-        let b_val = &b[j];
-
-        if a_val == b_val {
-            erase[k] = i;
-            i += 1;
-            j += 1;
-            k += 1;
-        } else if a_val < b_val {
-            i += 1;
-        } else {
+    a.retain(|x| {
+        // Advance `j` in `b` as long as `b[j]` is smaller than `x`
+        while j < b.len() && &b[j] < x {
             j += 1;
         }
-    }
-
-    assert!(k == 2 * LENGTH);
-
-    for k in erase {
-        a.swap_remove(k);
-    }
-
-    a.sort_unstable();
+        // If we found `x` in `b`, filter it out (return false)
+        if j < b.len() && &b[j] == x {
+            j += 1; // Move past this matched element
+            false
+        } else {
+            true // Keep element in `a`
+        }
+    });
 }
 
 /// Checks if b is a subset of a
@@ -284,17 +264,14 @@ fn is_subset<T: Ord>(a: &Vec<T>, b: &Vec<T>) -> bool {
     let mut i = 0;
     let mut j = 0;
 
-    while j < b.len() {
+    while i < a.len() && j < b.len() {
         let a_val = &a[i];
         let b_val = &b[j];
 
-        if a_val == b_val {
-            i += 1;
-            j += 1;
-        } else if a_val < b_val {
-            i += 1;
-        } else {
-            return false
+        match a_val.cmp(b_val) {
+            Ordering::Equal => { i += 1; j += 1 },
+            Ordering::Less => i += 1,
+            Ordering::Greater => return false,
         }
     }
 
@@ -305,20 +282,18 @@ fn is_disjoint<T: Ord>(a: &[T], b: &[T]) -> bool {
     let mut i = 0;
     let mut j = 0;
 
-    while i < a.len() && j < b.len() {
+    while i < a.len() || j < b.len() {
         let a_val = &a[i];
         let b_val = &b[j];
 
-        if a_val == b_val {
-            return true;
-        } else if a_val < b_val {
-            i += 1;
-        } else {
-            j += 1;
+        match a_val.cmp(b_val) {
+            Ordering::Equal => return false,
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
         }
     }
 
-    return false;
+    return true;
 }
 
 /// Assumes a and b are the same length
@@ -330,11 +305,12 @@ fn array_view_lt(a: ArrayView1<u8>, b: ArrayView1<u8>) -> bool {
         let a_val = &a[i];
         let b_val = &b[i];
 
-        if a_val < b_val {
-            return true;
-        } else if a_val > b_val {
-            return false;
+        match a_val.cmp(b_val) {
+            Ordering::Equal => (),
+            Ordering::Less => return true,
+            Ordering::Greater => return false,
         }
+
         i += 1;
     }
 

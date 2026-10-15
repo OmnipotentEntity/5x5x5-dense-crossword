@@ -7,6 +7,7 @@ use std::mem::MaybeUninit;
 use std::path::Path;
 use std::sync::Arc;
 
+use bytemuck;
 use indicatif::ProgressBar;
 use memmap2::{Mmap, MmapOptions};
 use ndarray::{s, Array1, Array2, ArrayView2, Axis};
@@ -33,7 +34,6 @@ pub struct WordDb {
     pub db: Arc<Mmap>,
     pub changes: [usize; LETTERS],
     pub count: usize,
-    db_file: File,
     lock_file: File,
     db_folder: String,
 }
@@ -54,7 +54,6 @@ impl WordDb {
         }?);
         Ok(WordDb {
             db: db,
-            db_file: db_file,
             lock_file: lock_file,
             db_folder: db_folder_string,
             count: count,
@@ -62,18 +61,21 @@ impl WordDb {
         })
     }
 
-    fn drop(&mut self) {
-        self.lock_file.unlock().unwrap();
-        remove_file(Path::new(&self.db_folder).join(LOCK_FILE_NAME)).unwrap();
-    }
-
     pub fn get(&self, idx: usize) -> Option<WordDbEntry<'_>> {
-        if idx <= self.count {
+        if idx < self.count {
             Some(WordDbEntry::deserialize(&self.db, idx * TOTAL_LEN))
         } else {
             None
         }
     }
+}
+
+impl Drop for WordDb {
+    fn drop(&mut self) {
+        self.lock_file.unlock().unwrap();
+        remove_file(Path::new(&self.db_folder).join(LOCK_FILE_NAME)).unwrap();
+    }
+
 }
 
 fn word_square_view(word_square: &[u8]) -> ArrayView2<'_, u8> {
@@ -97,22 +99,22 @@ impl<'a> WordDbEntry<'a> {
             .copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, HASH_LEN) });
     }
 
-    pub fn deserialize(source: &[u8], offset: usize) -> WordDbEntry<'_> {
-        let mut result: MaybeUninit<WordDbEntry> = MaybeUninit::uninit();
-        let ptr = result.as_mut_ptr();
+    pub fn deserialize(source: &'a [u8], offset: usize) -> WordDbEntry<'a> {
+        let square_bytes: &'a [u8; SQUARE_LEN] = source[offset..offset + SQUARE_LEN]
+            .try_into()
+            .unwrap();
 
-        unsafe {
-            (&raw mut (*ptr).word_square)
-                .write(source[offset..offset + SQUARE_LEN].try_into().unwrap());
-            // We do not consider endianess
-            (&raw mut (*ptr).word_square_words).cast::<&[u8]>().write(
-                source[offset + SQUARE_LEN..offset + TOTAL_LEN]
-                    .try_into()
-                    .unwrap(),
-            );
+        let hash_bytes: &'a [u8; HASH_LEN] = source[offset + SQUARE_LEN..offset + TOTAL_LEN]
+            .try_into()
+            .unwrap();
+
+        // Reinterprets &[u8; 20] as &[u16; 10] safely
+        let word_square_words: &'a [u16; 2 * LENGTH] = bytemuck::cast_ref(hash_bytes);
+
+        WordDbEntry {
+            word_square: square_bytes,
+            word_square_words,
         }
-
-        unsafe { result.assume_init() }
     }
 
     pub fn word_square_view(&self) -> ArrayView2<'_, u8> {
@@ -313,7 +315,7 @@ pub fn copy_json_to_database(
         idx += 1;
         count += 1;
 
-        if offset >= BUF_LEN {
+        if idx >= TXN_SIZE {
             let num_bytes = db_file_handle.write(&write_buffer)?;
             if num_bytes != BUF_LEN {
                 return Err(Box::new(DbErr::new("Could not write to disk")));
