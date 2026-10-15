@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 use std::thread::{self, available_parallelism};
 
+use indicatif::{MultiProgress,ProgressBar,ProgressStyle};
 use ndarray::{concatenate, s, stack, Array2, Array3, Array4, ArrayView1, Axis};
 
 use crate::data::{
@@ -88,9 +89,22 @@ pub fn solve_word_cubes(
 
     let num_threads = available_parallelism().unwrap().get();
 
+    let mp = Arc::new(MultiProgress::new());
+    let style = ProgressStyle::default_bar()
+        .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta}) {msg}")
+        .unwrap()
+        .progress_chars("#>-");
+
     let mut threads = Vec::new();
 
+
     for i in 0..num_threads {
+        let thread_total = (word_square_db.count + num_threads - 1 - i) / num_threads;
+        let mp_thread = mp.clone();
+        let pb = mp_thread.add(ProgressBar::new(thread_total as u64));
+        pb.set_style(style.clone());
+        pb.set_message(format!("Thread {}", i));
+
         let word_square_db = word_square_db.clone();
         let prefix_set = prefix_set.clone();
         let thread = thread::spawn(move || -> Result<Array4<u8>, ErrT> {
@@ -107,20 +121,22 @@ pub fn solve_word_cubes(
                     prefix_set: prefix_set.clone(),
                     used_words: Vec::from(db_entry.word_square_words),
                 };
-                solve_word_cube_impl(&mut wcd, 1, &mut results)?;
+                solve_word_cube_impl(&mut wcd, 1, &mut results, &mp_thread)?;
 
                 idx_mult += 1;
+                pb.inc(1);
             }
 
-            let result = stack(
-                Axis(0),
-                &results
-                    .iter()
-                    .map(|x| x.view())
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            )?
-            .to_owned();
+            pb.finish_with_message(format!("Thread {} complete", i));
+
+            let result = if results.is_empty() {
+                Array4::from_elem((0, LENGTH, LENGTH, LENGTH), EMPTY_CELL)
+            } else {
+                stack(
+                    Axis(0),
+                    &results.iter().map(|x| x.view()).collect::<Vec<_>>(),
+                )?
+            };
 
             Ok(result)
         });
@@ -150,6 +166,7 @@ fn solve_word_cube_impl(
     wcd: &mut WordCubeData,
     depth: usize,
     results: &mut Vec<Array3<u8>>,
+    mp: &MultiProgress,
 ) -> Result<(), ErrT> {
     let mut idx = find_least_valid_index(wcd, depth);
     let word_square_db = wcd.word_square_db.clone();
@@ -158,11 +175,11 @@ fn solve_word_cube_impl(
             let did_place = try_place_word_square(wcd, &wdb, depth, transposed);
             if did_place {
                 if depth == LENGTH - 1 {
-                    println!("Found solution: {:?}", wcd.word_cube);
+                    let _ = mp.println(format!("Found solution: {:?}", wcd.word_cube));
                     results.push(wcd.word_cube.clone());
                 } else {
                     set_insert(&mut wcd.used_words, wdb.word_square_words);
-                    solve_word_cube_impl(wcd, depth + 1, results)?;
+                    solve_word_cube_impl(wcd, depth + 1, results, mp)?;
                     set_difference(&mut wcd.used_words, wdb.word_square_words);
                 }
             }
@@ -207,25 +224,25 @@ fn try_place_word_square(
     let wsv = wdb.word_square_view();
 
     // Check each word along Axis(0) to check if it forms a valid prefix
-    for i in 0..(LENGTH * LENGTH) {
-        let major_idx = i / LENGTH;
-        let minor_idx = i % LENGTH;
-        let prefix = Vec::from_iter(
-            wcd.word_cube
-                .slice(s![0..depth, major_idx, minor_idx])
-                .iter()
-                .copied()
-                .chain(std::iter::once(if !transpose {
-                    wsv[[major_idx, minor_idx]]
-                } else {
-                    wsv[[minor_idx, major_idx]]
-                })),
-        );
+    let mut prefix = [0u8; LENGTH];
+    let slice_len = depth + 1;
 
-        match wcd.prefix_set.get(&prefix) {
-            Some(prefixes) if is_subset(&wcd.used_words, prefixes) => return false,
-            None => return false,
-            _ => (),
+    for major_idx in 0..LENGTH {
+        for minor_idx in 0..LENGTH {
+            for d in 0..depth {
+                prefix[d] = wcd.word_cube[[d, major_idx, minor_idx]];
+            }
+            prefix[depth] = if !transpose {
+                wsv[[major_idx, minor_idx]]
+            } else {
+                wsv[[minor_idx, major_idx]]
+            };
+
+            match wcd.prefix_set.get(&prefix[..slice_len]) {
+                Some(prefixes) if is_subset(&wcd.used_words, prefixes) => return false,
+                None => return false,
+                _ => (),
+            }
         }
     }
 

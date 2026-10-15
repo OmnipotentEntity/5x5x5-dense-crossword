@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fs::{exists, read_to_string, remove_file, File};
@@ -11,8 +10,10 @@ use bytemuck;
 use indicatif::ProgressBar;
 use memmap2::{Mmap, MmapOptions};
 use ndarray::{s, Array1, Array2, ArrayView2, Axis};
+use rustc_hash::FxHashMap;
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde_json::Deserializer as JsonDeserializer;
+use smallvec::SmallVec;
 
 pub const EMPTY_CELL: u8 = ' ' as u8;
 pub const LENGTH: usize = 5;
@@ -28,7 +29,7 @@ const TOTAL_LEN: usize = SQUARE_LEN + PADDING_LEN + HASH_LEN;
 const TXN_SIZE: usize = 1024 * 1024;
 const BUF_LEN: usize = TOTAL_LEN * TXN_SIZE;
 
-pub type PrefixSet = HashMap<Vec<u8>, Vec<u16>>;
+pub type PrefixSet = FxHashMap<SmallVec<[u8; LENGTH]>, Vec<u16>>;
 pub type ErrT = Box<dyn Error + Send + Sync>;
 
 pub struct WordDb {
@@ -358,7 +359,7 @@ pub fn copy_json_to_database(
 
 fn words_in_square(
     ws: &[u8],
-    reverse_word_map: &HashMap<Array1<u8>, u16>,
+    reverse_word_map: &FxHashMap<Array1<u8>, u16>,
 ) -> Result<[u16; 2 * LENGTH], ErrT> {
     let mut result = [const { MaybeUninit::uninit() }; 2 * LENGTH];
     let mut idx = 0;
@@ -399,8 +400,8 @@ pub fn read_words_from_file(file: String) -> Array2<u8> {
     Array2::from_shape_vec((count, LENGTH), raw_data).unwrap()
 }
 
-fn create_reverse_word_map(words: &Array2<u8>) -> HashMap<Array1<u8>, u16> {
-    let mut result = HashMap::new();
+fn create_reverse_word_map(words: &Array2<u8>) -> FxHashMap<Array1<u8>, u16> {
+    let mut result = FxHashMap::default();
     for i in 0..words.shape()[0] {
         result.insert(words.slice(s![i, ..]).to_owned(), i as u16);
     }
@@ -409,14 +410,14 @@ fn create_reverse_word_map(words: &Array2<u8>) -> HashMap<Array1<u8>, u16> {
 }
 
 pub fn generate_prefixes_from_words(words: &Array2<u8>) -> PrefixSet {
-    let mut result: PrefixSet = HashMap::new();
+    let mut result: PrefixSet = FxHashMap::default();
     for (word_id, word) in words.axis_iter(Axis(0)).enumerate() {
         for i in 0..LENGTH {
             let key_vec = word
                 .slice(s![0..i])
                 .to_owned()
                 .into_iter()
-                .collect::<Vec<_>>();
+                .collect::<SmallVec<_>>();
             let val = result.entry(key_vec).or_insert(Vec::new());
             val.push(word_id as u16);
         }
