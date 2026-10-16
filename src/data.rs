@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use bytemuck;
 use indicatif::ProgressBar;
-use memmap2::{Mmap, MmapOptions};
 use ndarray::{s, Array1, Array2, ArrayView2, Axis};
 use rustc_hash::FxHashMap;
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
@@ -17,10 +16,10 @@ use smallvec::SmallVec;
 
 pub const EMPTY_CELL: u8 = ' ' as u8;
 pub const LENGTH: usize = 5;
+pub const LETTERS: usize = 26;
 const LOCK_FILE_NAME: &str = "db.lock";
 const FLAG_FILE_NAME: &str = "db.flag";
 const DATABASE_FILE_NAME: &str = "db.db";
-const LETTERS: usize = 26;
 
 const SQUARE_LEN: usize = LENGTH * LENGTH * std::mem::size_of::<u8>();
 const PADDING_LEN: usize = SQUARE_LEN % std::mem::size_of::<u16>();
@@ -33,7 +32,7 @@ pub type PrefixSet = FxHashMap<SmallVec<[u8; LENGTH]>, Vec<u16>>;
 pub type ErrT = Box<dyn Error + Send + Sync>;
 
 pub struct WordDb {
-    pub db: Arc<Mmap>,
+    pub db: Arc<Vec<u8>>,
     pub changes: [usize; LETTERS],
     pub count: usize,
     lock_file: File,
@@ -47,15 +46,9 @@ impl WordDb {
         let lock_file = File::create(db_folder.join(LOCK_FILE_NAME))?;
         lock_file.try_lock()?;
         let (count, changes) = parse_flag_file(&db_folder_string)?;
-        let db_file = File::open(db_folder.join(DATABASE_FILE_NAME)).map_err(|e| Box::new(e))?;
-        let db = Arc::new(unsafe {
-            MmapOptions::new()
-                .huge(Some(21))
-                .no_reserve_swap()
-                .map(&db_file)
-        }?);
+        let db_bytes = std::fs::read(Path::new(&db_folder_string).join(DATABASE_FILE_NAME))?;
         Ok(WordDb {
-            db: db,
+            db: Arc::new(db_bytes),
             lock_file: lock_file,
             db_folder: db_folder_string,
             count: count,
@@ -93,7 +86,8 @@ impl<'a> WordDbEntry<'a> {
     // For speed, we directly copy raw bits to and fro with very little consistency checking
     pub fn serialize(&self, target: &mut [u8], offset: usize) {
         target[offset..offset + SQUARE_LEN].copy_from_slice(self.word_square);
-        target[offset + SQUARE_LEN] = 0;
+        target[offset + SQUARE_LEN..offset + SQUARE_LEN + PADDING_LEN]
+            .copy_from_slice(&[0; PADDING_LEN]);
 
         // We do not consider endianess
         let ptr: *const u8 = self.word_square_words.as_ptr().cast();

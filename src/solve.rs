@@ -2,11 +2,11 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 use std::thread::{self, available_parallelism};
 
-use indicatif::{MultiProgress,ProgressBar,ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use ndarray::{concatenate, s, stack, Array2, Array3, Array4, ArrayView1, Axis};
 
 use crate::data::{
-    generate_prefixes_from_words, ErrT, PrefixSet, WordDb, WordDbEntry, EMPTY_CELL, LENGTH,
+    generate_prefixes_from_words, ErrT, PrefixSet, WordDb, WordDbEntry, EMPTY_CELL, LENGTH, LETTERS,
 };
 
 /// This function generates all of the word cubes using the squares in word_square_db
@@ -97,7 +97,6 @@ pub fn solve_word_cubes(
 
     let mut threads = Vec::new();
 
-
     for i in 0..num_threads {
         let thread_total = (word_square_db.count + num_threads - 1 - i) / num_threads;
         let mp_thread = mp.clone();
@@ -162,17 +161,27 @@ pub fn solve_word_cubes(
     Ok(result)
 }
 
+#[derive(Clone, PartialEq)]
+enum PrefixMemo {
+    NotInit,
+    False,
+    True,
+}
+
 fn solve_word_cube_impl(
     wcd: &mut WordCubeData,
     depth: usize,
     results: &mut Vec<Array3<u8>>,
     mp: &MultiProgress,
 ) -> Result<(), ErrT> {
+    // The most expensive thing we do is check the prefix array.  This is a memo for just the
+    // prefixes we care about for this wordsquare
+    let mut prefix_memo = Array3::from_elem((LENGTH, LENGTH, LETTERS), PrefixMemo::NotInit);
     let mut idx = find_least_valid_index(wcd, depth);
     let word_square_db = wcd.word_square_db.clone();
     while let Some(wdb) = word_square_db.get(idx) {
         let mut handle_word_square_symmetry = |transposed: bool| -> Result<(), ErrT> {
-            let did_place = try_place_word_square(wcd, &wdb, depth, transposed);
+            let did_place = try_place_word_square(wcd, &wdb, depth, transposed, &mut prefix_memo);
             if did_place {
                 if depth == LENGTH - 1 {
                     let _ = mp.println(format!("Found solution: {:?}", wcd.word_cube));
@@ -214,6 +223,7 @@ fn try_place_word_square(
     wdb: &WordDbEntry,
     depth: usize,
     transpose: bool,
+    prefix_memo: &mut Array3<PrefixMemo>,
 ) -> bool {
     // If this word square contains a word we've already used
     // if !wcd.used_words.is_disjoint(&wdb.word_square_words) {
@@ -229,19 +239,37 @@ fn try_place_word_square(
 
     for major_idx in 0..LENGTH {
         for minor_idx in 0..LENGTH {
-            for d in 0..depth {
-                prefix[d] = wcd.word_cube[[d, major_idx, minor_idx]];
-            }
-            prefix[depth] = if !transpose {
+            let ws_letter = if !transpose {
                 wsv[[major_idx, minor_idx]]
             } else {
                 wsv[[minor_idx, major_idx]]
             };
 
-            match wcd.prefix_set.get(&prefix[..slice_len]) {
-                Some(prefixes) if is_subset(&wcd.used_words, prefixes) => return false,
-                None => return false,
+            match prefix_memo[[major_idx, minor_idx, ws_letter as usize - 'a' as usize]] {
+                PrefixMemo::False => return false,
+                PrefixMemo::True => continue,
                 _ => (),
+            }
+            for d in 0..depth {
+                prefix[d] = wcd.word_cube[[d, major_idx, minor_idx]];
+            }
+            prefix[depth] = ws_letter;
+
+            match wcd.prefix_set.get(&prefix[..slice_len]) {
+                Some(prefixes) if is_subset(&wcd.used_words, prefixes) => {
+                    prefix_memo[[major_idx, minor_idx, ws_letter as usize - 'a' as usize]] =
+                        PrefixMemo::False;
+                    return false;
+                }
+                None => {
+                    prefix_memo[[major_idx, minor_idx, ws_letter as usize - 'a' as usize]] =
+                        PrefixMemo::False;
+                    return false;
+                }
+                _ => {
+                    prefix_memo[[major_idx, minor_idx, ws_letter as usize - 'a' as usize]] =
+                        PrefixMemo::True;
+                }
             }
         }
     }
