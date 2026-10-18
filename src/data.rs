@@ -406,7 +406,7 @@ fn create_reverse_word_map(words: &Array2<u8>) -> FxHashMap<Array1<u8>, u16> {
 pub fn generate_prefixes_from_words(words: &Array2<u8>) -> PrefixSet {
     let mut result: PrefixSet = FxHashMap::default();
     for (word_id, word) in words.axis_iter(Axis(0)).enumerate() {
-        for i in 0..LENGTH {
+        for i in 0..=LENGTH {
             let key_vec = word
                 .slice(s![0..i])
                 .to_owned()

@@ -165,7 +165,7 @@ pub fn solve_word_cubes(
 enum PrefixMemo {
     NotInit,
     False,
-    True,
+    True(Vec<u16>),
 }
 
 fn solve_word_cube_impl(
@@ -176,7 +176,7 @@ fn solve_word_cube_impl(
 ) -> Result<(), ErrT> {
     // The most expensive thing we do is check the prefix array.  This is a memo for just the
     // prefixes we care about for this wordsquare
-    let mut prefix_memo = Array3::from_elem((LENGTH, LENGTH, LETTERS), PrefixMemo::NotInit);
+    let mut prefix_memo = [const { PrefixMemo::NotInit }; LENGTH * LENGTH * LETTERS];
     let mut idx = find_least_valid_index(wcd, depth);
     let word_square_db = wcd.word_square_db.clone();
     while let Some(wdb) = word_square_db.get(idx) {
@@ -223,15 +223,13 @@ fn try_place_word_square(
     wdb: &WordDbEntry,
     depth: usize,
     transpose: bool,
-    prefix_memo: &mut Array3<PrefixMemo>,
+    prefix_memo: &mut [PrefixMemo],
 ) -> bool {
     // If this word square contains a word we've already used
     // if !wcd.used_words.is_disjoint(&wdb.word_square_words) {
     if !is_disjoint(wcd.used_words.as_slice(), wdb.word_square_words) {
         return false;
     }
-
-    let wsv = wdb.word_square_view();
 
     // Check each word along Axis(0) to check if it forms a valid prefix
     let mut prefix = [0u8; LENGTH];
@@ -240,37 +238,59 @@ fn try_place_word_square(
     for major_idx in 0..LENGTH {
         for minor_idx in 0..LENGTH {
             let ws_letter = if !transpose {
-                wsv[[major_idx, minor_idx]]
+                wdb.word_square[major_idx * LENGTH + minor_idx]
             } else {
-                wsv[[minor_idx, major_idx]]
+                wdb.word_square[minor_idx * LENGTH + major_idx]
             };
 
-            match prefix_memo[[major_idx, minor_idx, ws_letter as usize - 'a' as usize]] {
+            // First, let's look up the prefix in our prefix cache
+            let letter_idx = ws_letter as usize - 'a' as usize;
+            let memo_idx = (major_idx * LENGTH + minor_idx) * LETTERS + letter_idx;
+            match &prefix_memo[memo_idx] {
+                // If this letter is marked as having an empty prefix set we can early out
                 PrefixMemo::False => return false,
-                PrefixMemo::True => continue,
-                _ => (),
-            }
-            for d in 0..depth {
-                prefix[d] = wcd.word_cube[[d, major_idx, minor_idx]];
-            }
-            prefix[depth] = ws_letter;
-
-            match wcd.prefix_set.get(&prefix[..slice_len]) {
-                Some(prefixes) if is_subset(&wcd.used_words, prefixes) => {
-                    prefix_memo[[major_idx, minor_idx, ws_letter as usize - 'a' as usize]] =
-                        PrefixMemo::False;
-                    return false;
+                // Otherwise, we can fetch the pared down prefixes, and test against only the new
+                // words in this word square
+                PrefixMemo::True(prefixes) => {
+                    if is_subset(wdb.word_square_words, &[], prefixes) {
+                        return false;
+                    }
                 }
-                None => {
-                    prefix_memo[[major_idx, minor_idx, ws_letter as usize - 'a' as usize]] =
-                        PrefixMemo::False;
-                    return false;
-                }
+                // If we haven't yet been initialized.  Build the prefix, and do the slow path,
+                // then initialize the memo
                 _ => {
-                    prefix_memo[[major_idx, minor_idx, ws_letter as usize - 'a' as usize]] =
-                        PrefixMemo::True;
+                    for d in 0..depth {
+                        prefix[d] = wcd.word_cube[[d, major_idx, minor_idx]];
+                    }
+                    prefix[depth] = ws_letter;
+
+                    match wcd.prefix_set.get(&prefix[..slice_len]) {
+                        Some(prefixes)
+                            if is_subset(&wcd.used_words, wdb.word_square_words, prefixes) =>
+                        {
+                            if prefix_memo[memo_idx] == PrefixMemo::NotInit
+                                && is_subset(&wcd.used_words, &[], prefixes)
+                            {
+                                prefix_memo[memo_idx] = PrefixMemo::False;
+                            } else {
+                                let mut memo_prefixes = prefixes.clone();
+                                set_difference(&mut memo_prefixes, wcd.used_words.as_slice());
+                                prefix_memo[memo_idx] = PrefixMemo::True(memo_prefixes);
+                            }
+                            return false;
+                        }
+                        Some(prefixes) => {
+                            let mut memo_prefixes = prefixes.clone();
+                            set_difference(&mut memo_prefixes, wcd.used_words.as_slice());
+                            prefix_memo[memo_idx] = PrefixMemo::True(memo_prefixes);
+                        }
+                        None => {
+                            prefix_memo[memo_idx] = PrefixMemo::False;
+                            return false;
+                        }
+                    }
                 }
-            }
+            };
         }
     }
 
@@ -287,13 +307,12 @@ fn try_place_word_square(
     true
 }
 
-fn set_insert<T: Ord + Copy>(dest: &mut Vec<T>, src: &[T; 2 * LENGTH]) {
+fn set_insert(dest: &mut Vec<u16>, src: &[u16; 2 * LENGTH]) {
     dest.extend_from_slice(src);
     dest.sort_unstable();
 }
 
-/// This is not a general set difference function!  This assumes every element in b is also in a.
-fn set_difference<T: Ord>(a: &mut Vec<T>, b: &[T; 2 * LENGTH]) {
+fn set_difference(a: &mut Vec<u16>, b: &[u16]) {
     let mut j = 0;
     a.retain(|x| {
         // Advance `j` in `b` as long as `b[j]` is smaller than `x`
@@ -310,26 +329,38 @@ fn set_difference<T: Ord>(a: &mut Vec<T>, b: &[T; 2 * LENGTH]) {
     });
 }
 
-/// Checks if b is a subset of a
-fn is_subset<T: Ord>(a: &Vec<T>, b: &Vec<T>) -> bool {
+/// Checks if c is a subset of a U b
+fn is_subset(a: &[u16], b: &[u16], c: &[u16]) -> bool {
     let mut i = 0;
     let mut j = 0;
+    let mut k = 0;
 
-    while i < a.len() && j < b.len() {
-        let a_val = &a[i];
-        let b_val = &b[j];
+    while (i < a.len() || j < b.len()) && k < c.len() {
+        let target = i == a.len() || (j != b.len() && b[j] < a[i]);
+        let cmp_val = if target { &b[j] } else { &a[i] };
+        let c_val = &c[k];
 
-        match a_val.cmp(b_val) {
+        match cmp_val.cmp(c_val) {
             Ordering::Equal => {
-                i += 1;
-                j += 1
+                if target {
+                    j += 1
+                } else {
+                    i += 1
+                };
+                k += 1
             }
-            Ordering::Less => i += 1,
+            Ordering::Less => {
+                if target {
+                    j += 1
+                } else {
+                    i += 1
+                }
+            }
             Ordering::Greater => return false,
         }
     }
 
-    j == b.len()
+    k == c.len()
 }
 
 fn is_disjoint<T: Ord>(a: &[T], b: &[T]) -> bool {
