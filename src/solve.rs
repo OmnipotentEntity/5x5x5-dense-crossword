@@ -1,4 +1,6 @@
 use std::cmp::Ordering;
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 use std::thread::{self, available_parallelism};
 
@@ -8,6 +10,34 @@ use ndarray::{concatenate, s, stack, Array2, Array3, Array4, ArrayView1, Axis};
 use crate::data::{
     generate_prefixes_from_words, ErrT, PrefixSet, WordDb, WordDbEntry, EMPTY_CELL, LENGTH, LETTERS,
 };
+
+use crate::args::ARGS;
+const MAX_BENCH_ITERS: usize = 1_000_000_000;
+
+#[derive(Debug)]
+pub struct SolveErr {
+    pub reason: String,
+}
+
+impl SolveErr {
+    fn new(reason: &str) -> SolveErr {
+        SolveErr {
+            reason: String::from(reason),
+        }
+    }
+}
+
+impl fmt::Display for SolveErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SolveErr : {}", self.reason)
+    }
+}
+
+impl Error for SolveErr {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        None
+    }
+}
 
 /// This function generates all of the word cubes using the squares in word_square_db
 /// word_square_db is assumed sorted by key, where the sorting function is only concerned with the
@@ -109,6 +139,7 @@ pub fn solve_word_cubes(
         let thread = thread::spawn(move || -> Result<Array4<u8>, ErrT> {
             let mut results = Vec::new();
             let mut idx_mult = 0;
+            let mut benchmark_iters = 0;
             while let Some(db_entry) = word_square_db.get(idx_mult * num_threads + i) {
                 let mut word_cube = Array3::from_elem((LENGTH, LENGTH, LENGTH), EMPTY_CELL);
                 word_cube
@@ -120,7 +151,12 @@ pub fn solve_word_cubes(
                     prefix_set: prefix_set.clone(),
                     used_words: Vec::from(db_entry.word_square_words),
                 };
-                solve_word_cube_impl(&mut wcd, 1, &mut results, &mp_thread)?;
+                let result = solve_word_cube_impl(&mut wcd, 1, &mut results, &mp_thread, &mut benchmark_iters);
+
+                if result.is_err() {
+                    pb.finish_with_message(format!("Thread {} died", i));
+                    return Err(result.err().unwrap());
+                }
 
                 idx_mult += 1;
                 pb.inc(1);
@@ -145,9 +181,16 @@ pub fn solve_word_cubes(
 
     let mut result_vec = Vec::new();
     for thread in threads {
-        let thread_results = thread.join().unwrap().unwrap();
+        let thread_results = match thread.join().unwrap() {
+            Ok(t_result) => t_result,
+            Err(t_err) => {
+                let _ = mp.clear();
+                return Err(t_err)
+            }
+        };
         result_vec.push(thread_results);
     }
+    let _ = mp.clear();
     let result = concatenate(
         Axis(0),
         &result_vec
@@ -173,6 +216,7 @@ fn solve_word_cube_impl(
     depth: usize,
     results: &mut Vec<Array3<u8>>,
     mp: &MultiProgress,
+    benchmark_iters: &mut usize,
 ) -> Result<(), ErrT> {
     // The most expensive thing we do is check the prefix array.  This is a memo for just the
     // prefixes we care about for this wordsquare
@@ -180,6 +224,12 @@ fn solve_word_cube_impl(
     let mut idx = find_least_valid_index(wcd, depth);
     let word_square_db = wcd.word_square_db.clone();
     while let Some(wdb) = word_square_db.get(idx) {
+        if ARGS.benchmark {
+            *benchmark_iters += 1;
+            if *benchmark_iters >= MAX_BENCH_ITERS {
+                return Err(Box::new(SolveErr::new("Benchmark complete")));
+            }
+        }
         let mut handle_word_square_symmetry = |transposed: bool| -> Result<(), ErrT> {
             let did_place = try_place_word_square(wcd, &wdb, depth, transposed, &mut prefix_memo);
             if did_place {
@@ -188,7 +238,7 @@ fn solve_word_cube_impl(
                     results.push(wcd.word_cube.clone());
                 } else {
                     set_insert(&mut wcd.used_words, wdb.word_square_words);
-                    solve_word_cube_impl(wcd, depth + 1, results, mp)?;
+                    solve_word_cube_impl(wcd, depth + 1, results, mp, benchmark_iters)?;
                     set_difference(&mut wcd.used_words, wdb.word_square_words);
                 }
             }

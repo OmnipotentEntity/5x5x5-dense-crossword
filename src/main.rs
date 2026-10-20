@@ -1,7 +1,5 @@
 use std::sync::Arc;
-
-use clap::Parser;
-// use ndarray::Array3;
+use std::time::Instant;
 
 mod args;
 mod data;
@@ -10,25 +8,33 @@ mod solve;
 use crate::data::{copy_json_to_database, read_words_from_file};
 use crate::data::{ErrT, WordDb};
 use crate::solve::solve_word_cubes;
+use crate::args::ARGS;
 
 fn main() -> Result<(), ErrT> {
-    let cli = args::Args::parse();
-    let db_folder = cli.db_folder;
+    let db_folder = ARGS.db_folder.clone();
 
     println!("Reading words from file");
-    let words = read_words_from_file(cli.word_file);
+    let words = read_words_from_file(ARGS.word_file.clone());
     println!("Done");
     println!("Reading squares from json");
-    copy_json_to_database(cli.json_file, db_folder.clone(), &words)?;
+    copy_json_to_database(ARGS.json_file.clone(), db_folder.clone(), &words)?;
     println!("Done");
 
     let db = WordDb::new(db_folder)?;
 
-    let result = solve_word_cubes(words, Arc::new(db))?;
+    if !ARGS.benchmark {
+        let result = solve_word_cubes(words, Arc::new(db))?;
+        let file = std::fs::File::create(ARGS.out_file.clone())?;
+        let file = std::io::BufWriter::new(file);
+        serde_json::to_writer(file, &result)?;
+    } else {
+        println!("Benchmark Mode Active!");
+        let now = Instant::now();
+        let _ = solve_word_cubes(words, Arc::new(db));
+        let elapsed_time = now.elapsed();
+        println!("Running 1 billion iterations took {} seconds.", elapsed_time.as_micros() as f64 / 1e6);
+    };
 
-    let file = std::fs::File::create(cli.out_file)?;
-    let file = std::io::BufWriter::new(file);
-    serde_json::to_writer(file, &result)?;
 
     Ok(())
 }
