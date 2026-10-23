@@ -5,22 +5,20 @@ mod args;
 mod data;
 mod solve;
 
+use crate::args::ARGS;
 use crate::data::{copy_json_to_database, read_words_from_file};
 use crate::data::{ErrT, WordDb};
 use crate::solve::solve_word_cubes;
-use crate::args::ARGS;
 
 fn main() -> Result<(), ErrT> {
-    let db_folder = ARGS.db_folder.clone();
-
     println!("Reading words from file");
     let words = read_words_from_file(ARGS.word_file.clone());
     println!("Done");
     println!("Reading squares from json");
-    copy_json_to_database(ARGS.json_file.clone(), db_folder.clone(), &words)?;
+    copy_json_to_database(&words)?;
     println!("Done");
 
-    let db = WordDb::new(db_folder)?;
+    let db = WordDb::new()?;
 
     if !ARGS.benchmark {
         let result = solve_word_cubes(words, Arc::new(db))?;
@@ -32,9 +30,11 @@ fn main() -> Result<(), ErrT> {
         let now = Instant::now();
         let _ = solve_word_cubes(words, Arc::new(db));
         let elapsed_time = now.elapsed();
-        println!("Running 1 billion iterations took {} seconds.", elapsed_time.as_micros() as f64 / 1e6);
+        println!(
+            "Running 1 billion iterations took {} seconds.",
+            elapsed_time.as_micros() as f64 / 1e6
+        );
     };
-
 
     Ok(())
 }

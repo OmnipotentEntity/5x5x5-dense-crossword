@@ -2,9 +2,7 @@ use std::sync::LazyLock;
 
 use clap::Parser;
 
-pub static ARGS: LazyLock<Args> = LazyLock::new(|| {
-    Args::parse()
-});
+pub static ARGS: LazyLock<Args> = LazyLock::new(|| Args::parse());
 
 /// Command line arguments for the program
 #[derive(Parser, Debug)]
@@ -24,7 +22,7 @@ pub struct Args {
     /// Database
     #[arg(short, long, default_value_t = String::from("ws.db"))]
     pub db_folder: String,
-    
+
     /// Benchmark mode
     #[arg(short, long, default_value_t = false)]
     pub benchmark: bool,

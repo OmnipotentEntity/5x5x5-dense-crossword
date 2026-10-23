@@ -1,12 +1,11 @@
 use std::error::Error;
 use std::fmt;
 use std::fs::{exists, read_to_string, remove_file, File};
-use std::io::{self, BufRead, Write};
-use std::mem::MaybeUninit;
+use std::io::{self, BufRead, Read, Write};
+use std::mem::{size_of, MaybeUninit};
 use std::path::Path;
 use std::sync::Arc;
 
-use bytemuck;
 use indicatif::ProgressBar;
 use ndarray::{s, Array1, Array2, ArrayView2, Axis};
 use rustc_hash::FxHashMap;
@@ -14,43 +13,77 @@ use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde_json::Deserializer as JsonDeserializer;
 use smallvec::SmallVec;
 
+use crate::args::ARGS;
+
 pub const EMPTY_CELL: u8 = ' ' as u8;
 pub const LENGTH: usize = 5;
 pub const LETTERS: usize = 26;
 const LOCK_FILE_NAME: &str = "db.lock";
 const FLAG_FILE_NAME: &str = "db.flag";
-const DATABASE_FILE_NAME: &str = "db.db";
+const WS_DATABASE_FILE_NAME: &str = "ws.db";
+const WSW_DATABASE_FILE_NAME: &str = "wsw.db";
 
-const SQUARE_LEN: usize = LENGTH * LENGTH * std::mem::size_of::<u8>();
-const PADDING_LEN: usize = SQUARE_LEN % std::mem::size_of::<u16>();
-const HASH_LEN: usize = 2 * LENGTH * std::mem::size_of::<u16>();
-const TOTAL_LEN: usize = SQUARE_LEN + PADDING_LEN + HASH_LEN;
+const SQUARE_LEN: usize = LENGTH * LENGTH * size_of::<u8>();
+const WORD_ARRAY_LEN: usize = 2 * LENGTH * size_of::<u16>();
 const TXN_SIZE: usize = 1024 * 1024;
-const BUF_LEN: usize = TOTAL_LEN * TXN_SIZE;
+const SQUARE_BUF_LEN: usize = SQUARE_LEN * TXN_SIZE;
+const WORD_ARRAY_BUF_LEN: usize = WORD_ARRAY_LEN * TXN_SIZE;
 
 pub type PrefixSet = FxHashMap<SmallVec<[u8; LENGTH]>, Vec<u16>>;
 pub type ErrT = Box<dyn Error + Send + Sync>;
 
 pub struct WordDb {
-    pub db: Arc<Vec<u8>>,
+    pub word_square: Arc<Vec<u8>>,
+    pub word_square_words: Arc<Vec<u16>>,
     pub changes: [usize; LETTERS],
     pub count: usize,
     lock_file: File,
-    db_folder: String,
 }
 
 impl WordDb {
-    pub fn new(db_folder: String) -> Result<WordDb, ErrT> {
-        let db_folder_string = db_folder.clone();
-        let db_folder = Path::new(&db_folder);
-        let lock_file = File::create(db_folder.join(LOCK_FILE_NAME))?;
+    pub fn new() -> Result<WordDb, ErrT> {
+        let db_folder = Path::new(&ARGS.db_folder);
+        let lock_file = File::create(Path::new(&db_folder.join(LOCK_FILE_NAME)))?;
         lock_file.try_lock()?;
-        let (count, changes) = parse_flag_file(&db_folder_string)?;
-        let db_bytes = std::fs::read(Path::new(&db_folder_string).join(DATABASE_FILE_NAME))?;
+        // read flag file
+        let (count, changes) = parse_flag_file(&ARGS.db_folder)?;
+
+        // init ws bytes
+        let word_square_bytes =
+            std::fs::read(Path::new(&ARGS.db_folder).join(WS_DATABASE_FILE_NAME))?;
+        let file_count = word_square_bytes.len() / (LENGTH * LENGTH);
+        if count != file_count {
+            return Err(Box::new(DbErr::new("Inconsistent lock file")));
+        }
+
+        // initialize wsw bytes
+        let mut wsw_file = File::open(Path::new(&ARGS.db_folder).join(WSW_DATABASE_FILE_NAME))?;
+        let file_len = wsw_file.metadata()?.len() as usize;
+        let wsw_record_len = size_of::<u16>() * 2 * LENGTH;
+        if count != file_len / wsw_record_len || file_len % 2 != 0 {
+            return Err(Box::new(DbErr::new(
+                format!(
+                    "Unexpected word square db size, expected: {}, got: {}",
+                    count * wsw_record_len,
+                    file_len
+                )
+                .as_str(),
+            )));
+        }
+        let mut word_square_words_bytes: Vec<u16> = Vec::with_capacity(count);
+        let wsw_ptr = word_square_words_bytes.as_ptr() as *mut u8;
+        let slice = unsafe { std::slice::from_raw_parts_mut(wsw_ptr, file_len) };
+        wsw_file.read_exact(slice)?;
+
+        unsafe {
+            word_square_words_bytes.set_len(file_len / size_of::<u16>());
+        }
+
+        // Return
         Ok(WordDb {
-            db: Arc::new(db_bytes),
+            word_square: Arc::new(word_square_bytes),
+            word_square_words: Arc::new(word_square_words_bytes),
             lock_file: lock_file,
-            db_folder: db_folder_string,
             count: count,
             changes: changes,
         })
@@ -58,7 +91,11 @@ impl WordDb {
 
     pub fn get(&self, idx: usize) -> Option<WordDbEntry<'_>> {
         if idx < self.count {
-            Some(WordDbEntry::deserialize(&self.db, idx * TOTAL_LEN))
+            Some(WordDbEntry::deserialize(
+                &self.word_square,
+                &self.word_square_words,
+                idx,
+            ))
         } else {
             None
         }
@@ -68,7 +105,7 @@ impl WordDb {
 impl Drop for WordDb {
     fn drop(&mut self) {
         self.lock_file.unlock().unwrap();
-        remove_file(Path::new(&self.db_folder).join(LOCK_FILE_NAME)).unwrap();
+        remove_file(Path::new(&ARGS.db_folder).join(LOCK_FILE_NAME)).unwrap();
     }
 }
 
@@ -84,32 +121,29 @@ pub struct WordDbEntry<'a> {
 
 impl<'a> WordDbEntry<'a> {
     // For speed, we directly copy raw bits to and fro with very little consistency checking
-    pub fn serialize(&self, target: &mut [u8], offset: usize) {
-        target[offset..offset + SQUARE_LEN].copy_from_slice(self.word_square);
-        target[offset + SQUARE_LEN..offset + SQUARE_LEN + PADDING_LEN]
-            .copy_from_slice(&[0; PADDING_LEN]);
+    pub fn serialize(&self, ws_target: &mut [u8], wsw_target: &mut [u8], idx: usize) {
+        let offset = idx * SQUARE_LEN;
+        ws_target[offset..offset + SQUARE_LEN].copy_from_slice(self.word_square);
 
-        // We do not consider endianess
+        let offset = idx * WORD_ARRAY_LEN;
         let ptr: *const u8 = self.word_square_words.as_ptr().cast();
-        target[offset + SQUARE_LEN + PADDING_LEN..offset + TOTAL_LEN]
-            .copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, HASH_LEN) });
+        // We do not consider endianess
+        wsw_target[offset..offset + WORD_ARRAY_LEN]
+            .copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, WORD_ARRAY_LEN) });
     }
 
-    pub fn deserialize(source: &'a [u8], offset: usize) -> WordDbEntry<'a> {
+    pub fn deserialize(ws_source: &'a [u8], wsw_source: &'a [u16], idx: usize) -> WordDbEntry<'a> {
+        let offset = idx * SQUARE_LEN;
         let square_bytes: &'a [u8; SQUARE_LEN] =
-            source[offset..offset + SQUARE_LEN].try_into().unwrap();
+            ws_source[offset..offset + SQUARE_LEN].try_into().unwrap();
 
-        let hash_bytes: &'a [u8; HASH_LEN] = source
-            [offset + SQUARE_LEN + PADDING_LEN..offset + TOTAL_LEN]
-            .try_into()
-            .unwrap();
-
-        // Reinterprets &[u8; 20] as &[u16; 10] safely
-        let word_square_words: &'a [u16; 2 * LENGTH] = bytemuck::cast_ref(hash_bytes);
+        let offset = idx * WORD_ARRAY_LEN;
+        let word_array_bytes: &'a [u16; 2 * LENGTH] =
+            wsw_source[offset..offset + 2 * LENGTH].try_into().unwrap();
 
         WordDbEntry {
             word_square: square_bytes,
-            word_square_words,
+            word_square_words: word_array_bytes,
         }
     }
 
@@ -268,16 +302,12 @@ fn parse_flag_file(db_folder: &String) -> Result<(usize, [usize; LETTERS]), ErrT
     return Ok((count, changes));
 }
 
-pub fn copy_json_to_database(
-    json_file: String,
-    db_folder: String,
-    words: &Array2<u8>,
-) -> Result<(), ErrT> {
+pub fn copy_json_to_database(words: &Array2<u8>) -> Result<(), ErrT> {
     let mut changes = [0; LETTERS];
     let reverse_word_map = create_reverse_word_map(words);
 
     // If we have an already running process
-    let lock_file = Path::new(&db_folder).join(LOCK_FILE_NAME);
+    let lock_file = Path::new(&ARGS.db_folder).join(LOCK_FILE_NAME);
     if exists(&lock_file)? {
         return Err(Box::new(DbErr::new("Lock file exists")));
     }
@@ -289,36 +319,43 @@ pub fn copy_json_to_database(
     lock_file.try_lock()?;
 
     // If we already have done this
-    let flag_file = Path::new(&db_folder).join(FLAG_FILE_NAME);
+    let flag_file = Path::new(&ARGS.db_folder).join(FLAG_FILE_NAME);
     if exists(&flag_file)? {
         return Ok(());
     }
 
-    let database_file = Path::new(&db_folder).join(DATABASE_FILE_NAME);
-    let mut db_file_handle = File::create(database_file)?;
-    let mut write_buffer: [u8; BUF_LEN] = [0; BUF_LEN];
+    let ws_file = Path::new(&ARGS.db_folder).join(WS_DATABASE_FILE_NAME);
+    let mut ws_file_handle = File::create(ws_file)?;
+    let mut ws_buffer = [0u8; SQUARE_BUF_LEN];
+
+    let wsw_file = Path::new(&ARGS.db_folder).join(WSW_DATABASE_FILE_NAME);
+    let mut wsw_file_handle = File::create(wsw_file)?;
+    let mut wsw_buffer = [0u8; WORD_ARRAY_BUF_LEN];
+
     let mut idx: usize = 0;
     let mut count: usize = 0;
 
-    read_json_with_visitor(json_file, &mut |data: &[u8; LENGTH * LENGTH],
-                                            id,
-                                            top_left_changed,
-                                            top_left|
+    read_json_with_visitor(ARGS.json_file.clone(), &mut |data: &[u8; LENGTH
+                                                              * LENGTH],
+                                                         id,
+                                                         top_left_changed,
+                                                         top_left|
      -> Result<(), ErrT> {
-        let offset = idx * TOTAL_LEN;
         let wsw = words_in_square(data, &reverse_word_map).unwrap();
         let word_db_entry = WordDbEntry {
             word_square: data,
             word_square_words: &wsw,
         };
 
-        word_db_entry.serialize(&mut write_buffer, offset);
+        word_db_entry.serialize(&mut ws_buffer, &mut wsw_buffer, idx);
         idx += 1;
         count += 1;
 
         if idx >= TXN_SIZE {
-            let num_bytes = db_file_handle.write(&write_buffer)?;
-            if num_bytes != BUF_LEN {
+            let ws_num_bytes = ws_file_handle.write(&ws_buffer)?;
+            let wsw_num_bytes = wsw_file_handle.write(&ws_buffer)?;
+
+            if (ws_num_bytes, wsw_num_bytes) != (SQUARE_BUF_LEN, WORD_ARRAY_BUF_LEN) {
                 return Err(Box::new(DbErr::new("Could not write to disk")));
             }
             idx = 0;
@@ -332,8 +369,10 @@ pub fn copy_json_to_database(
     })?;
 
     // Need to finish writing to file
-    db_file_handle.write(&write_buffer[0..idx * TOTAL_LEN])?;
-    db_file_handle.flush()?;
+    ws_file_handle.write(&ws_buffer[0..idx * SQUARE_LEN])?;
+    wsw_file_handle.write(&wsw_buffer[0..idx * WORD_ARRAY_BUF_LEN])?;
+    ws_file_handle.flush()?;
+    wsw_file_handle.flush()?;
 
     // Write the flag file
     let mut flag_file = File::create(flag_file)?;
@@ -346,7 +385,7 @@ pub fn copy_json_to_database(
 
     // remove lock file
     lock_file.unlock()?;
-    remove_file(Path::new(&db_folder).join(LOCK_FILE_NAME))?;
+    remove_file(Path::new(&ARGS.db_folder).join(LOCK_FILE_NAME))?;
 
     Ok(())
 }

@@ -151,7 +151,13 @@ pub fn solve_word_cubes(
                     prefix_set: prefix_set.clone(),
                     used_words: Vec::from(db_entry.word_square_words),
                 };
-                let result = solve_word_cube_impl(&mut wcd, 1, &mut results, &mp_thread, &mut benchmark_iters);
+                let result = solve_word_cube_impl(
+                    &mut wcd,
+                    1,
+                    &mut results,
+                    &mp_thread,
+                    &mut benchmark_iters,
+                );
 
                 if result.is_err() {
                     pb.finish_with_message(format!("Thread {} died", i));
@@ -185,7 +191,7 @@ pub fn solve_word_cubes(
             Ok(t_result) => t_result,
             Err(t_err) => {
                 let _ = mp.clear();
-                return Err(t_err)
+                return Err(t_err);
             }
         };
         result_vec.push(thread_results);
